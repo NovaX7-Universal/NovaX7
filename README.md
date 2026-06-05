@@ -38,7 +38,9 @@ then:
 `pip install PyQt6 python-vlc mutagen yt-dlp imageio-ffmpeg pypresence`
 3. Optional (for built-in browser):
 `pip install PyQt6-WebEngine`
-4. Run:
+Or press WINDOWS + R and type in pip install requirements.txt
+(still need to download python and vlc for that)
+5. Run in your PATH Terminal :
 `python NovaX7_7_1_0.py`
 
 ⚙️ Installation (Mac)
@@ -50,3 +52,5 @@ then:
 after that go into the explorer click on "new terminal in folder" (in the folder that nova is installed) and then type in:` python3 NovaX7_7_1_0.py`
 
 Thanks for testing! 🚀
+
+
