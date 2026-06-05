@@ -1,0 +1,1 @@
+pip install PyQt6 PyQt6-WebEngine mutagen python-vlc pypresence yt-dlp imageio-ffmpeg
