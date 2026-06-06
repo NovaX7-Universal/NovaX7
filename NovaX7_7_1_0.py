@@ -50,6 +50,7 @@ import sqlite3
 import json
 import shutil
 import random
+import math
 import threading
 import http.server
 import urllib.parse
@@ -100,7 +101,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QButtonGroup,
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal, QPoint, QPointF, QUrl, QMimeData, QRect, QRectF
+from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal, QPoint, QPointF, QUrl, QMimeData, QRect, QRectF, QElapsedTimer
 from PyQt6.QtGui import QFont, QPixmap, QAction, QIcon, QColor, QPalette, QKeySequence, QShortcut, QBrush, QPen, QDesktopServices
 
 # Optional: PyQtWebEngine for the YouTube browser panel
@@ -9758,6 +9759,19 @@ class NovaPlayer(QWidget):
         self.db = MusicDatabase()
         self.instance = vlc.Instance("--quiet", "--no-video-title-show", "--log-verbose=-1")
         self.player = self.instance.media_player_new()
+        self._crossfade_active = False
+        self._crossfade_phase = None          # "out" | "in"
+        self._crossfade_triggered = False
+        self._crossfade_pending_item = None
+        self._crossfade_elapsed = 0
+        self._crossfade_out_ms = 0
+        self._crossfade_in_ms = 0
+        self._crossfade_target_vol = 80
+        self._crossfade_last_vol = -1
+        self._crossfade_clock = QElapsedTimer()
+        self._crossfade_timer = QTimer()
+        self._crossfade_timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self._crossfade_timer.timeout.connect(self._tick_crossfade)
 
         self.current_song_path = None
         self.current_index = -1
@@ -9845,9 +9859,509 @@ class NovaPlayer(QWidget):
             return
         self._ext_last_status = {"state": "error", "message": "Media browser not available"}
 
+    def _ensure_extension_files(self, ext_dir):
+        """Auto-generate the Chrome extension folder and files if missing."""
+        import base64
+        try:
+            os.makedirs(ext_dir, exist_ok=True)
+            
+            manifest_path = os.path.join(ext_dir, "manifest.json")
+            if not os.path.exists(manifest_path):
+                manifest_json = """{
+  "manifest_version": 3,
+  "name": "Nova yt-dlp Downloader",
+  "version": "1.0",
+  "description": "Download videos and audio using the Nova media browser via yt-dlp",
+  "permissions": [
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}"""
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    f.write(manifest_json)
+
+            popup_html_path = os.path.join(ext_dir, "popup.html")
+            if not os.path.exists(popup_html_path):
+                popup_html = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root {
+      --bg-dark: #0d1117;
+      --bg-card: #161b22;
+      --border-color: #30363d;
+      --text-main: #c9d1d9;
+      --text-muted: #8b949e;
+      --accent-purple: #9d4edd;
+      --accent-purple-glow: rgba(157, 78, 221, 0.4);
+      --accent-green: #2ea44f;
+      --accent-red: #da3633;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      margin: 0;
+      padding: 16px;
+      width: 290px;
+      user-select: none;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .header h1 {
+      font-size: 16px;
+      font-weight: 700;
+      margin: 0;
+      letter-spacing: 0.5px;
+      background: linear-gradient(90deg, #c77dff, #e0aaff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .header .logo-symbol {
+      color: var(--accent-purple);
+      font-size: 18px;
+      font-weight: bold;
+    }
+
+    /* Mode Segmented Control */
+    .segmented-control {
+      display: flex;
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 2px;
+      margin-bottom: 16px;
+    }
+    .segmented-control button {
+      flex: 1;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      padding: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .segmented-control button.active {
+      background-color: var(--accent-purple);
+      color: #fff;
+      box-shadow: 0 2px 8px var(--accent-purple-glow);
+    }
+
+    /* Options Panel */
+    .options-group {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 16px;
+    }
+    .option-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .option-row:last-child {
+      margin-bottom: 0;
+    }
+    .option-row label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .option-row select {
+      background-color: var(--bg-dark);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 8px;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      outline: none;
+      transition: border-color 0.2s ease;
+    }
+    .option-row select:focus {
+      border-color: var(--accent-purple);
+    }
+
+    /* Download Button */
+    .dl-btn {
+      display: block;
+      width: 100%;
+      background: linear-gradient(135deg, #7b2cbf, #9d4edd);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 12px var(--accent-purple-glow);
+      text-align: center;
+    }
+    .dl-btn:hover {
+      opacity: 0.95;
+      box-shadow: 0 4px 16px rgba(157, 78, 221, 0.6);
+    }
+    .dl-btn:active {
+      transform: scale(0.98);
+    }
+    .dl-btn:disabled {
+      background: var(--border-color);
+      color: var(--text-muted);
+      box-shadow: none;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    /* Footer Connection Status */
+    .status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+      font-size: 12px;
+    }
+    .status-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-muted);
+    }
+    .status-indicator {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--accent-red);
+      box-shadow: 0 0 4px var(--accent-red);
+    }
+    .status-indicator.online {
+      background-color: var(--accent-green);
+      box-shadow: 0 0 6px var(--accent-green);
+    }
+    .download-progress {
+      font-weight: 600;
+      color: var(--accent-purple);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <span class="logo-symbol">⬡</span>
+    <h1>Nova Downloader</h1>
+  </div>
+
+  <div class="segmented-control">
+    <button id="modeVideoBtn" class="active">Video</button>
+    <button id="modeAudioBtn">Audio</button>
+  </div>
+
+  <!-- Options for Video Mode -->
+  <div id="videoOptions" class="options-group">
+    <div class="option-row">
+      <label for="videoFormat">Format</label>
+      <select id="videoFormat">
+        <option value="mp4" selected>MP4</option>
+        <option value="mkv">MKV</option>
+        <option value="webm">WebM</option>
+      </select>
+    </div>
+    <div class="option-row">
+      <label for="videoQuality">Quality</label>
+      <select id="videoQuality">
+        <option value="Best (4K+)">Best (4K+)</option>
+        <option value="1080p" selected>1080p (Full HD)</option>
+        <option value="720p">720p (HD)</option>
+        <option value="480p">480p (SD)</option>
+        <option value="360p">360p (Low)</option>
+        <option value="Smallest">Smallest</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Options for Audio Mode -->
+  <div id="audioOptions" class="options-group" style="display: none;">
+    <div class="option-row">
+      <label for="audioFormat">Format</label>
+      <select id="audioFormat">
+        <option value="mp3" selected>MP3</option>
+        <option value="m4a">M4A</option>
+        <option value="flac">FLAC</option>
+        <option value="wav">WAV</option>
+        <option value="ogg">OGG</option>
+      </select>
+    </div>
+    <div class="option-row">
+      <label for="audioQuality">Bitrate</label>
+      <select id="audioQuality">
+        <option value="320">320 kbps (Best)</option>
+        <option value="256">256 kbps</option>
+        <option value="192" selected>192 kbps (Standard)</option>
+        <option value="128">128 kbps (Small)</option>
+      </select>
+    </div>
+  </div>
+
+  <button id="downloadBtn" class="dl-btn">⬇ Download Video</button>
+
+  <div class="status-bar">
+    <div class="status-left">
+      <div id="statusIndicator" class="status-indicator"></div>
+      <span id="statusText">Connecting...</span>
+    </div>
+    <span id="progressText" class="download-progress"></span>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>"""
+                with open(popup_html_path, "w", encoding="utf-8") as f:
+                    f.write(popup_html)
+
+            popup_js_path = os.path.join(ext_dir, "popup.js")
+            if not os.path.exists(popup_js_path):
+                popup_js = """const API_BASE = "http://127.0.0.1:8765";
+
+// DOM elements
+const modeVideoBtn = document.getElementById("modeVideoBtn");
+const modeAudioBtn = document.getElementById("modeAudioBtn");
+const videoOptions = document.getElementById("videoOptions");
+const audioOptions = document.getElementById("audioOptions");
+const videoFormat = document.getElementById("videoFormat");
+const videoQuality = document.getElementById("videoQuality");
+const audioFormat = document.getElementById("audioFormat");
+const audioQuality = document.getElementById("audioQuality");
+const downloadBtn = document.getElementById("downloadBtn");
+const statusIndicator = document.getElementById("statusIndicator");
+const statusText = document.getElementById("statusText");
+const progressText = document.getElementById("progressText");
+
+let currentMode = "video"; // "video" or "audio"
+let isNovaOnline = false;
+
+// Toggle Mode
+modeVideoBtn.addEventListener("click", () => {
+  if (currentMode === "video") return;
+  currentMode = "video";
+  modeVideoBtn.classList.add("active");
+  modeAudioBtn.classList.remove("active");
+  videoOptions.style.display = "block";
+  audioOptions.style.display = "none";
+  updateDownloadBtnText();
+});
+
+modeAudioBtn.addEventListener("click", () => {
+  if (currentMode === "audio") return;
+  currentMode = "audio";
+  modeAudioBtn.classList.add("active");
+  modeVideoBtn.classList.remove("active");
+  audioOptions.style.display = "block";
+  videoOptions.style.display = "none";
+  updateDownloadBtnText();
+});
+
+function updateDownloadBtnText() {
+  if (currentMode === "video") {
+    downloadBtn.innerText = "⬇ Download Video";
+  } else {
+    downloadBtn.innerText = "⬇ Download Audio";
+  }
+}
+
+// Check if Nova is online
+async function checkNovaStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/ping`, { method: "GET", signal: AbortSignal.timeout(1000) });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.ok && data.app === "NovaX7") {
+        setOnline(true);
+        // Also fetch current download status if online
+        await fetchAppStatus();
+        return;
+      }
+    }
+    setOnline(false);
+  } catch (err) {
+    setOnline(false);
+  }
+}
+
+async function fetchAppStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/status`, { method: "GET", signal: AbortSignal.timeout(1000) });
+    if (res.ok) {
+      const status = await res.json();
+      if (status && status.state) {
+        let stateStr = status.state;
+        if (stateStr === "downloading") {
+          progressText.innerText = "Downloading...";
+          progressText.style.color = "var(--accent-purple)";
+        } else if (stateStr === "queued") {
+          progressText.innerText = "Queued...";
+          progressText.style.color = "var(--text-muted)";
+        } else if (stateStr === "error") {
+          progressText.innerText = "Error";
+          progressText.style.color = "var(--accent-red)";
+        } else {
+          progressText.innerText = ""; // Idle or offline
+        }
+      }
+    }
+  } catch (e) {
+    // Ignore error
+  }
+}
+
+function setOnline(online) {
+  isNovaOnline = online;
+  if (online) {
+    statusIndicator.classList.add("online");
+    statusText.innerText = "Nova Connected";
+    downloadBtn.removeAttribute("disabled");
+  } else {
+    statusIndicator.classList.remove("online");
+    statusText.innerText = "Nova Offline";
+    progressText.innerText = "";
+    downloadBtn.setAttribute("disabled", "true");
+  }
+}
+
+// Initiate download via Nova
+downloadBtn.addEventListener("click", async () => {
+  if (!isNovaOnline) return;
+
+  // Get active tab URL
+  chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+    if (!tabs || !tabs[0] || !tabs[0].url) {
+      alert("No active tab URL found.");
+      return;
+    }
+
+    const tabUrl = tabs[0].url;
+    if (!tabUrl.startsWith("http")) {
+      alert("Invalid page URL. Open a video page first (e.g. YouTube).");
+      return;
+    }
+
+    // Prepare payload
+    let format, quality;
+    if (currentMode === "video") {
+      format = videoFormat.value;
+      quality = videoQuality.value;
+    } else {
+      format = audioFormat.value;
+      quality = audioQuality.value;
+    }
+
+    const payload = {
+      url: tabUrl,
+      mode: currentMode,
+      format: format,
+      quality: quality
+    };
+
+    // Disable button to prevent double-click
+    downloadBtn.disabled = true;
+    downloadBtn.innerText = "Queuing...";
+
+    try {
+      const res = await fetch(`${API_BASE}/download`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (res.ok) {
+        const result = await res.json();
+        if (result.ok) {
+          progressText.innerText = "Queued!";
+          progressText.style.color = "var(--accent-green)";
+          setTimeout(() => {
+            progressText.innerText = "Downloading...";
+            progressText.style.color = "var(--accent-purple)";
+          }, 1500);
+        } else {
+          alert(`Failed to queue download: ${result.error}`);
+        }
+      } else {
+        alert("Failed to queue download: Server returned error status.");
+      }
+    } catch (err) {
+      alert(`Error connecting to Nova: ${err.message}`);
+    } finally {
+      setTimeout(() => {
+        updateDownloadBtnText();
+        if (isNovaOnline) {
+          downloadBtn.removeAttribute("disabled");
+        }
+      }, 2000);
+    }
+  });
+});
+
+// Periodic status checks
+checkNovaStatus();
+const intervalId = setInterval(checkNovaStatus, 1500);
+
+window.addEventListener("unload", () => {
+  clearInterval(intervalId);
+});"""
+                with open(popup_js_path, "w", encoding="utf-8") as f:
+                    f.write(popup_js)
+
+            # Write icons from base64
+            icons = {
+                "icon16.png": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAf0lEQVR4nGNgoBAw4pKY63f3P7pY8iZlDPWM+DQmbVSCi8/zv4fVICZCthJyHROpmtHVMzFQCJjIsR3ZFUyUuoAFXQA55HGJI8cIE7pCZElsAF2eiYFCwIQtheFyBbo4SB8TLpPRFeMyFG4AtnSOD8DUo7gAl1ewOR3Gpjg3AgAulDmrbHFBgwAAAABJRU5ErkJggg==",
+                "icon48.png": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAABL0lEQVR4nO2Z4RHCIAyFIeckuo/uYOaCHXQfXUV/eef1WiHwAgH7frfJFx4tXOLcrl1V8g6scH68Us/w/QTL61tBaxXje4GjCvG9wWsLIWcIviS+twJe6gZZhc/N69Hw19sx+Uy8PGFOkBtcZHHrSDjIOnyKZ84tFIyt/i+u+RwIRld/i28+B4YuIBjfPmucczkwosgNroP0hZzbZm2MKLitih2QXoW141OLJJpxqWUyjXjUIykyDtX2ZmqLiAXvf3NCfqOlRUSAg7BzQAqD2n6E7FXmQtXA84IPfhKn4NB/L9LoGG9B1sLzCpfaXWgJq3X4keYQ4gONgOcNHnhrUUP8t61F9DyrRJzIn+VAryI4I68YrMU3wYIFE38D2m6wMP5/TimnmRNbmNTvcp31BjrjlovRR/ZjAAAAAElFTkSuQmCC",
+                "icon128.png": "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADfElEQVR4nO2d7W0UQRBEF8uRQD6QAxsXkwPkg1MB8cPSCSFud766qvu9/6CZqrc9s2frfBwAAAAAAAAAUIUPRwG+ff75q/ffnj8+pc4o3eZGyq4ohf1GdhSeWQjLhSuUnkUGq8UqF+8qgvwinUp3lEF2YRmKdxDh5RAkY/mq+5IyUjGg7NNAYhGVilcTIfwIqFy+wv5fKm9ehcgcQsYPxescCdsnAOVr5bNVAMrXy2mbAJSvmdcWAShfN7flAlC+dn5LBaB8/RyXCUD5HnkuEYDy17Ai1+kCUP5aZuf7eiTl6/eP0//P9uXtyMbUCcDTv4eZOU8TgPL3MivvKQJQfgwzcg//fQCIZVgAnv5YRvNnAhRnSAGefg1GeugWgPK16O2DI6A4XQLw9GvS0wsToDgIUJzbAjD+tbnbDxOgOLcE4On34E5PTIDiIEBxLgvA+Pfial9MgOIgQHEQoDiXBOD89+RKb0yA4iBAcRCgOAhQnKcCcAH05ll/TIDiIEBxEKA4CFAcBCgOAhTnNeM3ebittQV+80j4BMj4tStO+w8XQCGEyvuWEEAljIr7Db8D/CsUp3uBa/FyE0A5pMz7khRANayM+5EVQDm0TPt4Uf+zZsrhOaz/WX/SE0AlxMzrthDAJUzH9Uq9BmZ4TWwmxdtNAIeQm+i6hgWIvgg6hN3E1nO1N8sJoBZ6E1lHD9YCKITfjMtPIUBkCc28/FsCKN4DIsto4uVf7cvqNVDhNbGJF1/yCNhVUktW/m0B1I+BlWU1o/Lv9JRyAswurRmVf5fbAjhNgRnlNbPy7/aTegKMltjMyu+hhAA9ZbYC5f+he5w7f2/A/14Tm3HxPcdzmQlwpeRmXH4v3QK4XQafld3My+/tY2gCZJGgFS2/7BHwSDMvf5RhAdyngDuj+ZefANWZIgBTIIYZuU+bAEiwl1l5Tz0CkGAPM3PmDlCc6QIwBdYyO98lEwAJ1rAi12VHABJ45Ln0DoAE+jkuvwQigXZ+W94CkEA3t22vgUigmdfWzwGQQC+n7R8EIYFWPqE/ynX+vcIsD0boR8FMg/gcwn8WUF2CM3j/UuFXOhJOEfElFlFJhFOkeJkjwCGkzPuSW1DGaXAKFv+O7MLcZTiFS3/EYpFOIpwmxb9jtVhVGU6z0h+xXXikEKdx4X+TZiOrpDgTlQ0AAAAAAADl+Q0q/n7nxz37KwAAAABJRU5ErkJggg=="
+            }
+            for name, b64_str in icons.items():
+                icon_path = os.path.join(ext_dir, name)
+                if not os.path.exists(icon_path):
+                    with open(icon_path, "wb") as f:
+                        f.write(base64.b64decode(b64_str))
+        except Exception as e:
+            print(f"[Nova] Failed to auto-generate extension files: {e}")
+
     def open_chrome_extension_dialog(self):
         """Show install instructions and open the extension folder / ZIP."""
         ext_dir = nova_extension_dir()
+        self._ensure_extension_files(ext_dir)
         if not os.path.isdir(ext_dir):
             QMessageBox.warning(
                 self, "Chrome Extension",
@@ -12606,6 +13120,218 @@ class NovaPlayer(QWidget):
 
     # ──────────────────────────── PLAYBACK ────────────────────────────
 
+    def _get_crossfade_ms(self):
+        try:
+            return max(0, int(self.db.get_setting("crossfade", "0"))) * 1000
+        except (TypeError, ValueError):
+            return 0
+
+    def _peek_next_item(self):
+        if self.song_list.count() == 0:
+            return None
+        if self.shuffle_enabled:
+            idx = random.randint(0, self.song_list.count() - 1)
+        else:
+            idx = (self.current_index + 1) % self.song_list.count()
+        return self.song_list.item(idx)
+
+    def _cancel_crossfade(self):
+        if self._crossfade_timer.isActive():
+            self._crossfade_timer.stop()
+        was_active = self._crossfade_active
+        self._crossfade_active = False
+        self._crossfade_phase = None
+        self._crossfade_triggered = False
+        self._crossfade_pending_item = None
+        self._crossfade_elapsed = 0
+        self._crossfade_out_ms = 0
+        self._crossfade_in_ms = 0
+        self._crossfade_last_vol = -1
+        if was_active and self.player.get_state() in (
+            vlc.State.Playing, vlc.State.Paused, vlc.State.Buffering,
+        ):
+            self.player.audio_set_volume(self.volume_slider.value())
+
+    def _set_crossfade_volume(self, vol):
+        vol = max(0, min(100, int(vol)))
+        if vol != self._crossfade_last_vol:
+            self.player.audio_set_volume(vol)
+            self._crossfade_last_vol = vol
+
+    def _tick_crossfade(self):
+        if not self._crossfade_active or not self._crossfade_phase:
+            return
+        self._crossfade_elapsed = self._crossfade_clock.elapsed()
+        target = self._crossfade_target_vol
+
+        if self._crossfade_phase == "out":
+            duration = self._crossfade_out_ms
+            if duration <= 0:
+                self._crossfade_switch_track()
+                return
+            progress = min(1.0, self._crossfade_elapsed / duration)
+            fade = math.cos(progress * math.pi / 2)
+            self._set_crossfade_volume(round(target * fade))
+            if progress >= 1.0:
+                self._crossfade_switch_track()
+        elif self._crossfade_phase == "in":
+            duration = self._crossfade_in_ms
+            if duration <= 0:
+                self._finish_crossfade()
+                return
+            progress = min(1.0, self._crossfade_elapsed / duration)
+            fade = math.sin(progress * math.pi / 2)
+            self._set_crossfade_volume(round(target * fade))
+            if progress >= 1.0:
+                self._finish_crossfade()
+
+    def _crossfade_switch_track(self):
+        item = self._crossfade_pending_item
+        if item is None:
+            self._cancel_crossfade()
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path or not os.path.exists(path):
+            self._cancel_crossfade()
+            self.play_selected_song(item)
+            return
+
+        self._crossfade_phase = "in"
+        self._crossfade_elapsed = 0
+        self._crossfade_last_vol = -1
+        self._crossfade_clock.restart()
+
+        media = self.instance.media_new(path)
+        self.player.set_media(media)
+        self.player.audio_set_volume(0)
+        self.player.play()
+
+        for i in range(self.song_list.count()):
+            if self.song_list.item(i) == item:
+                self.current_index = i
+                break
+
+    def _finish_crossfade(self):
+        self._crossfade_timer.stop()
+        self._crossfade_active = False
+        self._crossfade_phase = None
+        self._crossfade_triggered = False
+        item = self._crossfade_pending_item
+        self._crossfade_pending_item = None
+        self._crossfade_elapsed = 0
+        self._crossfade_out_ms = 0
+        self._crossfade_in_ms = 0
+        self._crossfade_last_vol = -1
+        vol = self.volume_slider.value()
+        self.player.audio_set_volume(vol)
+        self._end_handled = True
+        if item is not None:
+            QTimer.singleShot(0, lambda it=item: self._update_audio_now_playing(it))
+
+    def _update_crossfade_labels(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        song = self.db.get_song_by_path(path)
+        if not song:
+            return
+        _, title, artist, album, *_ = song
+        label = f"{artist}  ·  {album}" if album else artist
+        self.song_title_label.setText(title)
+        self.song_artist_label.setText(label)
+        self.bb_song_title.setText(title)
+        self.bb_song_artist.setText(label)
+
+    def _start_crossfade_to_item(self, item, duration_ms=None):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        item_type = item.data(Qt.ItemDataRole.UserRole + 2)
+        if not path or not os.path.exists(path) or item_type == "video":
+            self.play_selected_song(item)
+            return
+
+        crossfade_ms = self._get_crossfade_ms()
+        if crossfade_ms <= 0 or self.is_video_mode:
+            self.play_selected_song(item)
+            return
+
+        self._cancel_crossfade()
+        self._crossfade_pending_item = item
+        total_ms = duration_ms if duration_ms is not None else crossfade_ms
+        if total_ms <= 0:
+            self.play_selected_song(item)
+            return
+        self._crossfade_out_ms = max(300, total_ms // 2)
+        self._crossfade_in_ms = max(300, total_ms - self._crossfade_out_ms)
+        self._crossfade_elapsed = 0
+        self._crossfade_target_vol = self.volume_slider.value()
+        self._crossfade_active = True
+        self._crossfade_phase = "out"
+        self._crossfade_triggered = True
+        self._end_handled = True
+        self._crossfade_last_vol = -1
+        self._crossfade_clock.start()
+        self._update_crossfade_labels(item)
+        self._crossfade_timer.start(50)
+
+    def _update_audio_now_playing(self, item, *, increment_plays=True):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        item_id = item.data(Qt.ItemDataRole.UserRole + 1)
+
+        self.is_video_mode = False
+        self.cover_stack.setCurrentIndex(0)
+        self.popout_btn.setVisible(False)
+        self.current_song_path = path
+        self.current_song_id = item_id
+
+        song = self.db.get_song_by_path(path)
+        if song:
+            _, title, artist, album, _, cover_path, duration, fav, rating, plays = song
+            self.song_title_label.setText(title)
+            self.song_artist_label.setText(f"{artist}  ·  {album}")
+            self._update_fav_btn(bool(fav))
+            self._update_stars(rating)
+
+            if cover_path and os.path.exists(cover_path):
+                self.current_cover_path = cover_path
+                px = QPixmap(cover_path).scaled(
+                    240, 240,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                self.cover_label.setPixmap(px)
+                px_small = QPixmap(cover_path).scaled(
+                    52, 52,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self.bb_cover.setPixmap(px_small)
+            else:
+                self.current_cover_path = None
+                self.cover_label.clear()
+                self.cover_label.setText("♫")
+                self.cover_label.setFont(QFont("Arial", 48))
+                self.bb_cover.clear()
+                self.bb_cover.setText("♫")
+                self.bb_cover.setFont(QFont("Arial", 20))
+
+            self.bb_song_title.setText(title)
+            self.bb_song_artist.setText(f"{artist}  ·  {album}")
+            self._update_bb_fav(bool(fav))
+            if increment_plays:
+                self.db.increment_play_count(item_id)
+            self._load_lyrics(artist, title, song_id=item_id)
+            self._discord.set_playing(
+                title=title,
+                artist=artist,
+                album=album,
+                duration_ms=int(duration) if duration else 0,
+                elapsed_ms=0,
+                is_video=False,
+            )
+
+        for i in range(self.song_list.count()):
+            if self.song_list.item(i) == item:
+                self.current_index = i
+                break
+
     def play_song(self, path, song_id):
         """Play a song directly by file path and database ID.
         Builds a temporary QListWidgetItem so play_selected_song can be reused."""
@@ -12628,6 +13354,7 @@ class NovaPlayer(QWidget):
 
         # ── VIDEO ──
         if item_type == "video":
+            self._cancel_crossfade()
             self.is_video_mode = True
             # Only switch cover_stack when NOT in fullscreen (video_frame may be reparented)
             if not (hasattr(self, "_fs_win") and self._fs_win):
@@ -12685,72 +13412,13 @@ class NovaPlayer(QWidget):
             return
 
         # ── AUDIO ──
-        self.is_video_mode = False
-        self.cover_stack.setCurrentIndex(0)
-        # Hide pop-out button in audio mode
-        self.popout_btn.setVisible(False)
-
-        self.current_song_path = path
-        self.current_song_id = item_id
-
+        self._cancel_crossfade()
+        self._crossfade_triggered = False
         self.player.stop()
         media = self.instance.media_new(path)
         self.player.set_media(media)
         self.player.play()
-
-        song = self.db.get_song_by_path(path)
-        if song:
-            _, title, artist, album, _, cover_path, duration, fav, rating, plays = song
-            self.song_title_label.setText(title)
-            self.song_artist_label.setText(f"{artist}  ·  {album}")
-            self._update_fav_btn(bool(fav))
-            self._update_stars(rating)
-
-            if cover_path and os.path.exists(cover_path):
-                self.current_cover_path = cover_path
-                px = QPixmap(cover_path).scaled(
-                    240, 240,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                self.cover_label.setPixmap(px)
-                # Sync bottom bar cover
-                px_small = QPixmap(cover_path).scaled(52, 52, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-                self.bb_cover.setPixmap(px_small)
-            else:
-                self.current_cover_path = None
-                self.cover_label.clear()
-                self.cover_label.setText("♫")
-                self.cover_label.setFont(QFont("Arial", 48))
-                self.bb_cover.clear()
-                self.bb_cover.setText("♫")
-                self.bb_cover.setFont(QFont("Arial", 20))
-
-            # Sync bottom bar labels
-            self.bb_song_title.setText(title)
-            self.bb_song_artist.setText(f"{artist}  ·  {album}")
-            self._update_bb_fav(bool(fav))
-
-            self.db.increment_play_count(item_id)
-
-            # ── Lyrics: fetch for this song ──────────────────────────────
-            self._load_lyrics(artist, title, song_id=item_id)
-
-            # ── Discord Rich Presence ────────────────────────────────────
-            self._discord.set_playing(
-                title=title,
-                artist=artist,
-                album=album,
-                duration_ms=int(duration) if duration else 0,
-                elapsed_ms=0,
-                is_video=False,
-            )
-
-        for i in range(self.song_list.count()):
-            it = self.song_list.item(i)
-            if it == item:
-                self.current_index = i
-                break
+        self._update_audio_now_playing(item)
 
     def preview_song_info(self, item):
         pass
@@ -12758,13 +13426,13 @@ class NovaPlayer(QWidget):
     def toggle_play_pause(self):
         state = self.player.get_state()
         if state in (vlc.State.Playing,):
-            self.player.pause()
+            self.pause_song()
             # ── Discord: Pause-Status setzen ──
             title = self.song_title_label.text()
             artist = self.song_artist_label.text().split("  ·  ")[0]
             self._discord.set_paused(title, artist)
         else:
-            self.player.play()
+            self.resume_song()
             # ── Discord: Wiedergabe-Status wiederherstellen ──
             if self.current_song_path:
                 song = self.db.get_song_by_path(self.current_song_path)
@@ -12793,13 +13461,27 @@ class NovaPlayer(QWidget):
         self.player.pause()
 
     def stop_song(self):
+        self._cancel_crossfade()
         self.player.stop()
         self.progress_slider.setValue(0)
         self.time_label.setText("0:00 / 0:00")
         self._discord.clear()
 
     def change_volume(self, value):
-        self.player.audio_set_volume(value)
+        if self._crossfade_active:
+            self._crossfade_target_vol = value
+            if self._crossfade_phase == "out":
+                duration = self._crossfade_out_ms
+                progress = min(1.0, self._crossfade_elapsed / duration) if duration > 0 else 1.0
+                fade = math.cos(progress * math.pi / 2)
+                self._set_crossfade_volume(round(value * fade))
+            elif self._crossfade_phase == "in":
+                duration = self._crossfade_in_ms
+                progress = min(1.0, self._crossfade_elapsed / duration) if duration > 0 else 1.0
+                fade = math.sin(progress * math.pi / 2)
+                self._set_crossfade_volume(round(value * fade))
+        else:
+            self.player.audio_set_volume(value)
         self.vol_label.setText(f"{value}%")
         # Keep both sliders in sync without causing infinite recursion
         if self.sender() is self.volume_slider and self.bb_volume.value() != value:
@@ -12837,7 +13519,10 @@ class NovaPlayer(QWidget):
         else:
             self.current_index = (self.current_index + 1) % self.song_list.count()
         item = self.song_list.item(self.current_index)
-        self.play_selected_song(item)
+        if self._get_crossfade_ms() > 0 and not self.is_video_mode:
+            self._start_crossfade_to_item(item)
+        else:
+            self.play_selected_song(item)
 
     def play_previous(self):
         if self.song_list.count() == 0:
@@ -12895,6 +13580,28 @@ class NovaPlayer(QWidget):
 
     def update_progress(self):
         try:
+            if self._crossfade_active:
+                state = self.player.get_state()
+                if self._vid_controls is not None:
+                    self._vid_controls.sync_play_state(state == vlc.State.Playing)
+                if self._crossfade_phase == "out" and state == vlc.State.Ended:
+                    self._crossfade_switch_track()
+                if self.sleep_timer:
+                    if self.player.is_playing():
+                        self.sleep_elapsed += 0.4
+                    remaining = self.sleep_minutes * 60 - self.sleep_elapsed
+                    if remaining <= 0:
+                        self._cancel_crossfade()
+                        self.player.stop()
+                        self.sleep_timer = None
+                        self.sleep_label.setText("")
+                        QMessageBox.information(self, "Sleep Timer", "Sleep timer elapsed. Playback stopped.")
+                    else:
+                        mins = int(remaining // 60)
+                        secs = int(remaining % 60)
+                        self.sleep_label.setText(f"☾ {mins}:{secs:02d}")
+                return
+
             length = self.player.get_length()
             current = self.player.get_time()
             if length > 0 and not self.is_slider_pressed:
@@ -12914,6 +13621,7 @@ class NovaPlayer(QWidget):
                 if (self._lyrics_lines
                         and self._lyrics_timestamps
                         and not self.is_video_mode
+                        and not self._crossfade_active
                         and self._lyrics_box.isVisible()):
                     # Find the last line whose timestamp <= current position
                     new_line = -1
@@ -12926,12 +13634,29 @@ class NovaPlayer(QWidget):
                         self._lyrics_current_line = new_line
                         self._render_lyrics(new_line)
 
+                if (not self._crossfade_active
+                        and not self._crossfade_triggered
+                        and not self.is_video_mode
+                        and not self.loop_enabled
+                        and self.db.get_setting("auto_next", "1") == "1"):
+                    crossfade_ms = self._get_crossfade_ms()
+                    out_length = self.player.get_length()
+                    out_current = self.player.get_time()
+                    if crossfade_ms > 0 and out_length > 0:
+                        effective_ms = min(crossfade_ms, max(500, out_length // 2))
+                        remaining = out_length - out_current
+                        if 0 < remaining <= effective_ms:
+                            next_item = self._peek_next_item()
+                            if (next_item
+                                    and next_item.data(Qt.ItemDataRole.UserRole + 2) != "video"):
+                                self._start_crossfade_to_item(next_item, duration_ms=effective_ms)
+
             state = self.player.get_state()
             # Sync play-button icon in overlay
             if self._vid_controls is not None:
                 self._vid_controls.sync_play_state(state == vlc.State.Playing)
             if state == vlc.State.Ended:
-                if not self._end_handled:
+                if not self._end_handled and not self._crossfade_active and not self._crossfade_triggered:
                     self._end_handled = True
                     # If the video was playing inside a pop-out window, close it
                     # first so VLC's handle is released before we reload media.
