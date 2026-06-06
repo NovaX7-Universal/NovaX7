@@ -9840,6 +9840,12 @@ class NovaPlayer(QWidget):
         self._ext_server = NovaExtensionServer(self)
         self._ext_server.start()
 
+        # Auto-generate extension folder on every start so it's always present
+        try:
+            self._ensure_extension_files(nova_extension_dir())
+        except Exception:
+            pass
+
     # ──────────────────────────── CHROME EXTENSION ────────────────────────────
 
     def queue_extension_download(self, data):
