@@ -1,4 +1,4 @@
-# Version: 7.1.0-updated
+# Version: 7.1.1
 import sys as _sys
 import os as _os
 
@@ -4757,8 +4757,51 @@ class PasswordManagerPanel(QWidget):
 import hashlib as _hashlib
 import urllib.request as _urllib_req
 
-_NOVA_SCRIPT = os.path.abspath(__file__)
-_NOVA_CONFIG = os.path.join(os.path.dirname(_NOVA_SCRIPT), "nova_config.json")
+_NOVA_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova_config.json")
+_NOVA_VERSION = "7.1.1"
+_NOVA_UPDATE_URL = (
+    "https://raw.githubusercontent.com/NovaX7-Universal/NovaX7/main/NovaX7_7_1_0.py"
+)
+
+
+def _get_nova_script_path():
+    """Absolute path to the .py file the user started — updated in-place on update."""
+    if sys.argv:
+        candidate = os.path.abspath(sys.argv[0])
+        if candidate.lower().endswith(".py") and os.path.isfile(candidate):
+            return candidate
+    return os.path.abspath(__file__)
+
+
+def _apply_script_update(script_path, new_content):
+    """Replace the contents of an existing .py file (no new file with another name)."""
+    import tempfile
+    script_path = os.path.abspath(script_path)
+    if not script_path.lower().endswith(".py"):
+        raise ValueError(f"Kein Python-Skript: {script_path}")
+    if not os.path.isfile(script_path):
+        raise FileNotFoundError(f"Datei nicht gefunden: {script_path}")
+
+    backup_path = script_path + ".backup"
+    shutil.copy2(script_path, backup_path)
+
+    dir_name = os.path.dirname(script_path) or "."
+    fd, tmp_path = tempfile.mkstemp(suffix=".py", dir=dir_name, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(new_content)
+        os.replace(tmp_path, script_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        # Fallback: direct overwrite of the running file
+        with open(script_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(new_content)
+
+    return script_path, backup_path
 
 
 def _load_nova_config():
@@ -4795,6 +4838,39 @@ def _fetch_github_raw(raw_url, token):
     )
     with _urllib_req.urlopen(req, timeout=30) as r:
         return r.read().decode("utf-8")
+
+
+def _fetch_public_update(url=None):
+    """Download latest NovaX7 from the public GitHub repo (no token required)."""
+    import time
+    base = (url or _NOVA_UPDATE_URL).split("?")[0]
+    req = _urllib_req.Request(
+        f"{base}?t={int(time.time())}",
+        headers={
+            "User-Agent": "NovaX7-Updater/1.0",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+    with _urllib_req.urlopen(req, timeout=30) as r:
+        return r.read().decode("utf-8")
+
+
+def _parse_version_from_source(source):
+    for line in source.splitlines()[:8]:
+        if line.startswith("# Version:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _fetch_update_source():
+    """Fetch remote Nova script — private config if set, otherwise public GitHub."""
+    cfg = _load_nova_config()
+    raw_url = cfg.get("github_raw_url", "").strip()
+    token = cfg.get("github_token", "").strip()
+    if raw_url and token:
+        return _fetch_github_raw(raw_url, token)
+    return _fetch_public_update()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5211,13 +5287,18 @@ class SettingsDialog(QDialog):
         update_layout.addWidget(upd_title)
 
         _cfg = _load_nova_config()
-        _has_cfg = bool(_cfg.get("github_token") and _cfg.get("github_raw_url"))
+        _uses_private = bool(_cfg.get("github_token") and _cfg.get("github_raw_url"))
         upd_desc = QLabel(
-            "✓ GitHub verbunden — drücke den Button um zu updaten." if _has_cfg else
-            "Noch nicht eingerichtet — starte nova_upload.py einmalig auf deinem PC."
+            f"Installierte Version: <b>{_NOVA_VERSION}</b><br>"
+            "Updates werden direkt aus Nova geladen — kein <code>nova_updater.py</code> "
+            "oder <code>nova_upload.py</code> nötig."
+            + ("<br><small>Privates GitHub-Repo aus nova_config.json wird verwendet.</small>"
+               if _uses_private else
+               "<br><small>Quelle: NovaX7-Universal/NovaX7 auf GitHub</small>")
         )
         upd_desc.setWordWrap(True)
-        upd_desc.setStyleSheet(f"font-size:12px; color:{'#38f5c8' if _has_cfg else '#888'};")
+        upd_desc.setTextFormat(Qt.TextFormat.RichText)
+        upd_desc.setStyleSheet("font-size:12px; color:#8892b0;")
         update_layout.addWidget(upd_desc)
 
         self._upd_status = QLabel("")
@@ -5227,10 +5308,8 @@ class SettingsDialog(QDialog):
 
         upd_btn = QPushButton("🔄  Jetzt updaten")
         upd_btn.setFixedHeight(42)
-        upd_btn.setEnabled(_has_cfg)
         upd_btn.setStyleSheet(
             "QPushButton { border-radius:8px; padding:6px 18px; font-weight:bold; font-size:14px; }"
-            "QPushButton:disabled { opacity:0.4; }"
         )
         upd_btn.clicked.connect(self._check_and_apply_update)
         update_layout.addWidget(upd_btn)
@@ -5293,37 +5372,38 @@ class SettingsDialog(QDialog):
             btn.setStyleSheet(f"background:{col}; border:1px solid #555; border-radius:3px;")
 
     def _check_and_apply_update(self):
-        cfg = _load_nova_config()
-        token   = cfg.get("github_token", "").strip()
-        raw_url = cfg.get("github_raw_url", "").strip()
-
-        if not token or not raw_url:
-            self._upd_status.setStyleSheet("font-size:12px; color:#e05c4a;")
-            self._upd_status.setText("⚠ Nicht eingerichtet. Starte nova_upload.py zuerst.")
-            return
-
         self._upd_status.setStyleSheet("font-size:12px; color:#8892b0;")
-        self._upd_status.setText("⏳ Verbinde mit GitHub…")
+        self._upd_status.setText("⏳ Suche nach Updates…")
         QApplication.processEvents()
 
         try:
-            remote_code = _fetch_github_raw(raw_url, token)
+            remote_code = _fetch_update_source()
         except Exception as e:
             self._upd_status.setStyleSheet("font-size:12px; color:#e05c4a;")
             self._upd_status.setText(f"✗ Download fehlgeschlagen: {e}")
             return
 
-        current_hash = _file_hash(_NOVA_SCRIPT)
+        if not remote_code.strip().startswith("# Version:"):
+            self._upd_status.setStyleSheet("font-size:12px; color:#e05c4a;")
+            self._upd_status.setText("✗ Ungültige Update-Datei vom Server erhalten.")
+            return
+
+        current_hash = _file_hash(_get_nova_script_path())
         remote_hash  = _hashlib.sha256(remote_code.encode("utf-8")).hexdigest()
 
         if current_hash == remote_hash:
             self._upd_status.setStyleSheet("font-size:12px; color:#38f5c8;")
-            self._upd_status.setText("✓ Bereits aktuell — kein Update nötig.")
+            self._upd_status.setText(f"✓ Bereits aktuell (Version {_NOVA_VERSION}).")
             return
 
+        script_path = _get_nova_script_path()
+        remote_ver = _parse_version_from_source(remote_code) or "neu"
         reply = QMessageBox.question(
             self, "Update verfügbar",
-            "Neue Version gefunden.\n\nNova wird aktualisiert und neu gestartet.\nFortfahren?",
+            f"Neue Version gefunden: {remote_ver}\n"
+            f"Aktuell installiert: {_NOVA_VERSION}\n\n"
+            f"Die bestehende Datei wird ersetzt:\n{script_path}\n\n"
+            "Nova wird aktualisiert und neu gestartet.\nFortfahren?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -5331,23 +5411,24 @@ class SettingsDialog(QDialog):
             self._upd_status.setText("Update abgebrochen.")
             return
 
-        self._upd_status.setText("⏳ Installiere Update…")
+        self._upd_status.setText(f"⏳ Ersetze Inhalt von {os.path.basename(script_path)}…")
         QApplication.processEvents()
 
         try:
-            import shutil as _shutil
-            _shutil.copy2(_NOVA_SCRIPT, _NOVA_SCRIPT + ".backup")
-            with open(_NOVA_SCRIPT, "w", encoding="utf-8") as f:
-                f.write(remote_code)
+            updated_path, backup_path = _apply_script_update(script_path, remote_code)
         except Exception as e:
             self._upd_status.setStyleSheet("font-size:12px; color:#e05c4a;")
             self._upd_status.setText(f"✗ Schreibfehler: {e}")
             return
 
-        self._upd_status.setText("✓ Fertig! Nova startet neu…")
+        self._upd_status.setStyleSheet("font-size:12px; color:#38f5c8;")
+        self._upd_status.setText(
+            f"✓ {os.path.basename(updated_path)} aktualisiert "
+            f"(Backup: {os.path.basename(backup_path)}). Nova startet neu…"
+        )
         QApplication.processEvents()
         import subprocess as _sp
-        _sp.Popen([sys.executable, _NOVA_SCRIPT])
+        _sp.Popen([sys.executable, updated_path])
         QApplication.quit()
 
     def _reset_all_settings(self):
