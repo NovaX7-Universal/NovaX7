@@ -1,4 +1,4 @@
-# Version: 7.1.3
+# Version: 7.1.4
 import sys as _sys
 import os as _os
 
@@ -1533,7 +1533,8 @@ class MusicDatabase:
         needed = {"duration": "INTEGER DEFAULT 0", "play_count": "INTEGER DEFAULT 0",
                   "last_played": "TEXT", "date_added": "TEXT",
                   "favourite": "INTEGER DEFAULT 0", "rating": "INTEGER DEFAULT 0",
-                  "cover_path": "TEXT", "yt_url": "TEXT", "lyrics": "TEXT"}
+                  "cover_path": "TEXT", "yt_url": "TEXT", "lyrics": "TEXT",
+                  "playback_position_ms": "INTEGER DEFAULT 0"}
         for col, typedef in needed.items():
             if col not in cols:
                 self.cursor.execute(f"ALTER TABLE songs ADD COLUMN {col} {typedef}")
@@ -1696,6 +1697,21 @@ class MusicDatabase:
         self.cursor.execute(
             "INSERT INTO play_history(song_id,played_at) VALUES(?,?)",
             (song_id, datetime.now().isoformat())
+        )
+        self.conn.commit()
+
+    def get_playback_position(self, song_id):
+        row = self.cursor.execute(
+            "SELECT playback_position_ms FROM songs WHERE id=?", (song_id,)
+        ).fetchone()
+        if not row or row[0] is None:
+            return 0
+        return max(0, int(row[0]))
+
+    def set_playback_position(self, song_id, ms):
+        self.cursor.execute(
+            "UPDATE songs SET playback_position_ms=? WHERE id=?",
+            (max(0, int(ms)), song_id),
         )
         self.conn.commit()
 
@@ -4758,7 +4774,7 @@ import hashlib as _hashlib
 import urllib.request as _urllib_req
 
 _NOVA_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova_config.json")
-_NOVA_VERSION = "7.1.3"
+_NOVA_VERSION = "7.1.4"
 _NOVA_UPDATE_URL = (
     "https://raw.githubusercontent.com/NovaX7-Universal/NovaX7/main/NovaX7_7_1_0.py"
 )
@@ -4927,10 +4943,23 @@ def _fetch_update_source():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+class _UpdateFetchThread(QThread):
+    """Download update source off the UI thread."""
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            self.finished.emit(_fetch_update_source())
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent, db, current_theme):
         super().__init__(parent)
         self.db = db
+        self._upd_thread = None
         self.setWindowTitle("Settings")
         self.setMinimumSize(560, 560)
         self.resize(580, 620)
@@ -5425,17 +5454,20 @@ class SettingsDialog(QDialog):
             btn.setStyleSheet(f"background:{col}; border:1px solid #555; border-radius:3px;")
 
     def _check_and_apply_update(self):
+        if self._upd_thread and self._upd_thread.isRunning():
+            return
         self._upd_status.setStyleSheet("font-size:12px; color:#8892b0;")
         self._upd_status.setText("⏳ Suche nach Updates…")
-        QApplication.processEvents()
+        self._upd_thread = _UpdateFetchThread(self)
+        self._upd_thread.finished.connect(self._on_update_fetched)
+        self._upd_thread.failed.connect(self._on_update_fetch_failed)
+        self._upd_thread.start()
 
-        try:
-            remote_code = _fetch_update_source()
-        except Exception as e:
-            self._upd_status.setStyleSheet("font-size:12px; color:#e05c4a;")
-            self._upd_status.setText(f"✗ Download fehlgeschlagen: {e}")
-            return
+    def _on_update_fetch_failed(self, err):
+        self._upd_status.setStyleSheet("font-size:12px; color:#e05c4a;")
+        self._upd_status.setText(f"✗ Download fehlgeschlagen: {err}")
 
+    def _on_update_fetched(self, remote_code):
         if not remote_code.strip().startswith("# Version:"):
             self._upd_status.setStyleSheet("font-size:12px; color:#e05c4a;")
             self._upd_status.setText("✗ Ungültige Update-Datei vom Server erhalten.")
@@ -5870,7 +5902,7 @@ class AutoclickerPanel(QWidget):
                     font-weight: bold;
                 }
                 QPushButton#action_btn:hover {
-                    filter: brightness(1.1);
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #f87171, stop:1 #dc2626);
                 }
             """
         else:
@@ -5883,7 +5915,7 @@ class AutoclickerPanel(QWidget):
                     font-weight: bold;
                 }}
                 QPushButton#action_btn:hover {{
-                    filter: brightness(1.1);
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {t.get('accent2', t['accent'])}, stop:1 {t['accent']});
                 }}
             """
         self.toggle_btn.setStyleSheet(style)
@@ -7595,10 +7627,9 @@ class YouTubeBrowserPanel(QWidget):
         # ── TikTok / Google: spoof navigator so the site treats us as real Chrome ──
         spoof_js = r"""
 (function() {
-    // 1) Hide webdriver flag
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    // webdriver is already patched by Nova's DocumentCreation stealth script
 
-    // 2) window.chrome — TikTok player won't init without this
+    // 1) window.chrome — TikTok player won't init without this
     if (!window.chrome) {
         window.chrome = {
             runtime: { id: undefined, connect: function(){}, sendMessage: function(){} },
@@ -7938,6 +7969,29 @@ class YouTubeBrowserPanel(QWidget):
         if view:
             view.setFocus()
 
+    def shutdown(self):
+        """Release browser tabs cleanly on app exit (reduces WebEngine warnings)."""
+        if self._browser_fs_window is not None:
+            try:
+                self._hide_browser_fullscreen_overlay()
+            except Exception:
+                pass
+        if not self.tab_widget:
+            return
+        while self.tab_widget.count() > 0:
+            widget = self.tab_widget.widget(0)
+            self.tab_widget.removeTab(0)
+            if widget is not None:
+                try:
+                    widget.setUrl(QUrl("about:blank"))
+                except Exception:
+                    pass
+                widget.deleteLater()
+        for popup in list(_NOVA_POPUP_REGISTRY):
+            try:
+                popup.close()
+            except Exception:
+                pass
 
     def _toggle_browser_fullscreen_window(self):
         if self._browser_fs_window is None:
@@ -9918,6 +9972,9 @@ class NovaPlayer(QWidget):
         self._crossfade_timer = QTimer()
         self._crossfade_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._crossfade_timer.timeout.connect(self._tick_crossfade)
+
+        self._skip_position_restore = False
+        self._pos_save_ticks = 0
 
         self.current_song_path = None
         self.current_index = -1
@@ -13278,6 +13335,50 @@ window.addEventListener("unload", () => {
         except (TypeError, ValueError):
             return 0
 
+    def _remember_pos_enabled(self):
+        return self.db.get_setting("remember_pos", "0") == "1"
+
+    def _save_playback_position(self, *, clear=False):
+        if not self._remember_pos_enabled() or self.is_video_mode:
+            return
+        song_id = self.current_song_id
+        if not song_id:
+            return
+        if clear:
+            self.db.set_playback_position(song_id, 0)
+            return
+        try:
+            current = self.player.get_time()
+            length = self.player.get_length()
+        except Exception:
+            return
+        if current < 0:
+            return
+        if length > 0 and (current >= length - 2000 or current >= length * 0.95):
+            self.db.set_playback_position(song_id, 0)
+            return
+        if current < 3000:
+            return
+        self.db.set_playback_position(song_id, current)
+
+    def _restore_playback_position(self, song_id):
+        if not self._remember_pos_enabled() or not song_id:
+            return
+        pos = self.db.get_playback_position(song_id)
+        if pos < 3000:
+            return
+
+        def _try_seek(attempt=0):
+            if attempt > 12:
+                return
+            length = self.player.get_length()
+            if length <= 0:
+                QTimer.singleShot(250, lambda: _try_seek(attempt + 1))
+                return
+            self.player.set_time(min(pos, max(0, length - 500)))
+
+        QTimer.singleShot(350, lambda: _try_seek(0))
+
     def _peek_next_item(self):
         if self.song_list.count() == 0:
             return None
@@ -13404,6 +13505,7 @@ window.addEventListener("unload", () => {
             self.play_selected_song(item)
             return
 
+        self._save_playback_position()
         self._cancel_crossfade()
         self._crossfade_pending_item = item
         total_ms = duration_ms if duration_ms is not None else crossfade_ms
@@ -13504,6 +13606,8 @@ window.addEventListener("unload", () => {
             QMessageBox.warning(self, "Missing File", f"File not found:\n{path}")
             return
 
+        self._save_playback_position()
+
         # ── VIDEO ──
         if item_type == "video":
             self._cancel_crossfade()
@@ -13570,7 +13674,11 @@ window.addEventListener("unload", () => {
         media = self.instance.media_new(path)
         self.player.set_media(media)
         self.player.play()
+        skip_restore = self._skip_position_restore
+        self._skip_position_restore = False
         self._update_audio_now_playing(item)
+        if not skip_restore and item_id:
+            self._restore_playback_position(item_id)
 
     def preview_song_info(self, item):
         pass
@@ -13613,6 +13721,7 @@ window.addEventListener("unload", () => {
         self.player.pause()
 
     def stop_song(self):
+        self._save_playback_position(clear=True)
         self._cancel_crossfade()
         self.player.stop()
         self.progress_slider.setValue(0)
@@ -13671,6 +13780,7 @@ window.addEventListener("unload", () => {
         else:
             self.current_index = (self.current_index + 1) % self.song_list.count()
         item = self.song_list.item(self.current_index)
+        self._skip_position_restore = True
         if self._get_crossfade_ms() > 0 and not self.is_video_mode:
             self._start_crossfade_to_item(item)
         else:
@@ -13756,6 +13866,12 @@ window.addEventListener("unload", () => {
 
             length = self.player.get_length()
             current = self.player.get_time()
+            if (not self.is_video_mode and self.current_song_id
+                    and self._remember_pos_enabled() and not self._crossfade_active):
+                self._pos_save_ticks += 1
+                if self._pos_save_ticks >= 25:
+                    self._pos_save_ticks = 0
+                    self._save_playback_position()
             if length > 0 and not self.is_slider_pressed:
                 self.progress_slider.setMaximum(length)
                 self.progress_slider.setValue(current)
@@ -13823,6 +13939,7 @@ window.addEventListener("unload", () => {
                         self.player.set_media(media)
                         self.player.play()
                     else:
+                        self._save_playback_position(clear=True)
                         if self.db.get_setting("auto_next", "1") == "1":
                             self.play_next()
             elif state in (vlc.State.Playing, vlc.State.Paused, vlc.State.Buffering):
@@ -15286,7 +15403,25 @@ window.addEventListener("unload", () => {
                 self._discord.disable()
 
     def closeEvent(self, event):
-        """Trennt Discord RPC sauber beim Beenden der App."""
+        """Clean shutdown: save position, release VLC/browser/Discord resources."""
+        try:
+            self._save_playback_position()
+        except Exception:
+            pass
+        try:
+            self._cancel_crossfade()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_popout_win", None):
+                self._close_popout_window()
+        except Exception:
+            pass
+        if getattr(self, "yt_browser", None):
+            try:
+                self.yt_browser.shutdown()
+            except Exception:
+                pass
         if getattr(self, "_ext_server", None):
             self._ext_server.stop()
         self._discord.disconnect()
