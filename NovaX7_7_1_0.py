@@ -1,4 +1,4 @@
-# Version: 7.1.2
+# Version: 7.1.3
 import sys as _sys
 import os as _os
 
@@ -4758,7 +4758,7 @@ import hashlib as _hashlib
 import urllib.request as _urllib_req
 
 _NOVA_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova_config.json")
-_NOVA_VERSION = "7.1.2"
+_NOVA_VERSION = "7.1.3"
 _NOVA_UPDATE_URL = (
     "https://raw.githubusercontent.com/NovaX7-Universal/NovaX7/main/NovaX7_7_1_0.py"
 )
