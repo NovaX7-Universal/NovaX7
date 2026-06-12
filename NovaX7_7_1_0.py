@@ -1,4 +1,4 @@
-# Version: 7.1.1
+# Version: 7.1.2
 import sys as _sys
 import os as _os
 
@@ -4758,7 +4758,7 @@ import hashlib as _hashlib
 import urllib.request as _urllib_req
 
 _NOVA_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova_config.json")
-_NOVA_VERSION = "7.1.1"
+_NOVA_VERSION = "7.1.2"
 _NOVA_UPDATE_URL = (
     "https://raw.githubusercontent.com/NovaX7-Universal/NovaX7/main/NovaX7_7_1_0.py"
 )
@@ -4828,12 +4828,17 @@ def _file_hash(path):
 
 
 def _fetch_github_raw(raw_url, token):
+    import time
+    base = raw_url.split("?")[0]
+    url = f"{base}?t={int(time.time())}"
     req = _urllib_req.Request(
-        raw_url,
+        url,
         headers={
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3.raw",
             "User-Agent": "NovaX7-Updater/1.0",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         }
     )
     with _urllib_req.urlopen(req, timeout=30) as r:
@@ -4856,21 +4861,69 @@ def _fetch_public_update(url=None):
         return r.read().decode("utf-8")
 
 
+def _parse_semver(text):
+    import re
+    if not text:
+        return None
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", str(text))
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _format_semver(parts):
+    return f"{parts[0]}.{parts[1]}.{parts[2]}"
+
+
+def _compare_semver(a, b):
+    """Return -1 if a<b, 0 if equal, 1 if a>b."""
+    if a == b:
+        return 0
+    return 1 if a > b else -1
+
+
 def _parse_version_from_source(source):
-    for line in source.splitlines()[:8]:
+    import re
+    for line in source.splitlines()[:20]:
         if line.startswith("# Version:"):
-            return line.split(":", 1)[1].strip()
+            raw = line.split(":", 1)[1].strip()
+            parts = _parse_semver(raw)
+            return _format_semver(parts) if parts else raw
+    m = re.search(r'_NOVA_VERSION\s*=\s*["\']([^"\']+)["\']', source)
+    if m:
+        parts = _parse_semver(m.group(1))
+        return _format_semver(parts) if parts else m.group(1).strip()
     return ""
 
 
+def _get_installed_version():
+    """Read semver from the running script file (falls back to _NOVA_VERSION)."""
+    try:
+        path = _get_nova_script_path()
+        with open(path, encoding="utf-8") as f:
+            chunk = f.read(12000)
+        ver = _parse_version_from_source(chunk)
+        if ver:
+            parts = _parse_semver(ver)
+            if parts:
+                return _format_semver(parts)
+    except Exception:
+        pass
+    parts = _parse_semver(_NOVA_VERSION)
+    return _format_semver(parts) if parts else _NOVA_VERSION
+
+
 def _fetch_update_source():
-    """Fetch remote Nova script — private config if set, otherwise public GitHub."""
+    """Fetch latest Nova script from GitHub (always cache-busted)."""
     cfg = _load_nova_config()
     raw_url = cfg.get("github_raw_url", "").strip()
     token = cfg.get("github_token", "").strip()
-    if raw_url and token:
+    # Public repo: always use cache-busted raw URL (avoids stale CDN copies).
+    if not raw_url or "NovaX7-Universal/NovaX7" in raw_url:
+        return _fetch_public_update(_NOVA_UPDATE_URL)
+    if token:
         return _fetch_github_raw(raw_url, token)
-    return _fetch_public_update()
+    return _fetch_public_update(_NOVA_UPDATE_URL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5289,7 +5342,7 @@ class SettingsDialog(QDialog):
         _cfg = _load_nova_config()
         _uses_private = bool(_cfg.get("github_token") and _cfg.get("github_raw_url"))
         upd_desc = QLabel(
-            f"Installierte Version: <b>{_NOVA_VERSION}</b><br>"
+            f"Installierte Version: <b>{_get_installed_version()}</b><br>"
             "Updates werden direkt aus Nova geladen — kein <code>nova_updater.py</code> "
             "oder <code>nova_upload.py</code> nötig."
             + ("<br><small>Privates GitHub-Repo aus nova_config.json wird verwendet.</small>"
@@ -5390,18 +5443,29 @@ class SettingsDialog(QDialog):
 
         current_hash = _file_hash(_get_nova_script_path())
         remote_hash  = _hashlib.sha256(remote_code.encode("utf-8")).hexdigest()
+        local_ver = _get_installed_version()
+        remote_ver = _parse_version_from_source(remote_code) or "?"
+        local_parts = _parse_semver(local_ver)
+        remote_parts = _parse_semver(remote_ver)
 
         if current_hash == remote_hash:
             self._upd_status.setStyleSheet("font-size:12px; color:#38f5c8;")
-            self._upd_status.setText(f"✓ Bereits aktuell (Version {_NOVA_VERSION}).")
+            self._upd_status.setText(f"✓ Bereits aktuell (Version {local_ver}).")
+            return
+
+        if local_parts and remote_parts and _compare_semver(remote_parts, local_parts) <= 0:
+            self._upd_status.setStyleSheet("font-size:12px; color:#38f5c8;")
+            self._upd_status.setText(
+                f"✓ Bereits aktuell — installiert: {local_ver}, "
+                f"Server: {remote_ver} (kein Downgrade)."
+            )
             return
 
         script_path = _get_nova_script_path()
-        remote_ver = _parse_version_from_source(remote_code) or "neu"
         reply = QMessageBox.question(
             self, "Update verfügbar",
             f"Neue Version gefunden: {remote_ver}\n"
-            f"Aktuell installiert: {_NOVA_VERSION}\n\n"
+            f"Aktuell installiert: {local_ver}\n\n"
             f"Die bestehende Datei wird ersetzt:\n{script_path}\n\n"
             "Nova wird aktualisiert und neu gestartet.\nFortfahren?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
