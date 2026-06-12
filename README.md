@@ -38,7 +38,7 @@ then:
 `pip install PyQt6 python-vlc mutagen yt-dlp imageio-ffmpeg pypresence`
 3. Optional (for built-in browser):
 `pip install PyQt6-WebEngine`
-Or press WINDOWS + R and type in `pip install -r requiremnts.txt`
+Or press WINDOWS + R and type in `pip install -r requirements.txt`
 (still need to download python and vlc for that)
 
 5. Run in your PATH Terminal :
