@@ -1,4 +1,4 @@
-# Version: 7.1.6
+# Version: 7.1.7
 import sys as _sys
 import os as _os
 
@@ -1202,7 +1202,7 @@ _TRANSLATIONS = {
         "Toggle Favourite": "Toggle Favourite",
         "Fullscreen": "⛶  Fullscreen",
         "Fullscreen tooltip": "Open fullscreen (or double-click image/video)",
-        "Sleep": "☾ Sleep",
+        "Sleep": "☾ Sleeeeeep",
         "Queue": "☰ Queue",
         "Ready": "Ready",
         # Context menu – songs
@@ -5506,7 +5506,7 @@ import hashlib as _hashlib
 import urllib.request as _urllib_req
 
 _NOVA_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova_config.json")
-_NOVA_VERSION = "7.1.6"
+_NOVA_VERSION = "7.1.7"
 _NOVA_UPDATE_URL = (
     "https://raw.githubusercontent.com/NovaX7-Universal/NovaX7/main/NovaX7_7_1_0.py"
 )
