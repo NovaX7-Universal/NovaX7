@@ -1,4 +1,4 @@
-# Version: 7.1.4
+# Version: 7.1.5
 import sys as _sys
 import os as _os
 
@@ -49,15 +49,18 @@ import subprocess
 import os
 import sqlite3
 import json
+import gzip
 import shutil
 import random
 import math
 import threading
+import concurrent.futures
 import http.server
 import urllib.parse
 import urllib.request
 import base64
 import hashlib
+import html
 import hmac
 import secrets
 import struct
@@ -88,6 +91,7 @@ from PyQt6.QtWidgets import (
     QFontComboBox,
     QCheckBox,
     QSpinBox,
+    QDoubleSpinBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -101,9 +105,11 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QGridLayout,
     QButtonGroup,
+    QGraphicsOpacityEffect,
+    QTextBrowser,
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal, QPoint, QPointF, QUrl, QMimeData, QRect, QRectF, QElapsedTimer
-from PyQt6.QtGui import QFont, QPixmap, QAction, QIcon, QColor, QPalette, QKeySequence, QShortcut, QBrush, QPen, QDesktopServices
+from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal, QPoint, QPointF, QUrl, QMimeData, QRect, QRectF, QElapsedTimer, QEasingCurve, QPropertyAnimation, QParallelAnimationGroup, QVariantAnimation
+from PyQt6.QtGui import QFont, QPixmap, QAction, QIcon, QColor, QPalette, QKeySequence, QShortcut, QBrush, QPen, QDesktopServices, QPainter
 
 # Optional: PyQtWebEngine for the YouTube browser panel
 try:
@@ -168,6 +174,394 @@ except ImportError:
 # Discord Application Client-ID (öffentliche Nova-App-ID – kann angepasst werden)
 _DISCORD_CLIENT_ID = "1504475285834432522"   # ← hier eigene App-ID eintragen
 
+# Optional: offline AI chat (Gemma 4 E2B via llama.cpp)
+_LLAMA_CPP_IMPORT_ERROR = ""
+
+
+def _bootstrap_llama_cpp_dll_path():
+    """Help Windows locate llama.dll and bundled deps before import."""
+    if os.name != "nt":
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("llama_cpp")
+        if not spec or not spec.origin:
+            return
+        lib_dir = os.path.join(os.path.dirname(spec.origin), "lib")
+        if os.path.isdir(lib_dir):
+            os.add_dll_directory(lib_dir)
+    except Exception:
+        pass
+
+
+_bootstrap_llama_cpp_dll_path()
+try:
+    from llama_cpp import Llama as _LlamaCpp
+    from llama_cpp.llama_chat_format import Gemma4ChatHandler as _Gemma4ChatHandler
+    _LLAMA_CPP_AVAILABLE = True
+except Exception as e:
+    _LlamaCpp = None
+    _Gemma4ChatHandler = None
+    _LLAMA_CPP_AVAILABLE = False
+    _LLAMA_CPP_IMPORT_ERROR = str(e)
+    print(f"[Nova] llama-cpp-python unavailable: {e}")
+    print("       AI chat will stay disabled until the inference engine is fixed.")
+
+_NOVA_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".nova_models")
+_GEMMA_MODEL_FILENAME = "gemma-4-E2B-it-Q4_K_M.gguf"
+_GEMMA_MMPROJ_FILENAME = "mmproj-gemma-4-E2B-it-BF16.gguf"
+_GEMMA_MODEL_PATH = os.path.join(_NOVA_MODELS_DIR, _GEMMA_MODEL_FILENAME)
+_GEMMA_MMPROJ_PATH = os.path.join(_NOVA_MODELS_DIR, _GEMMA_MMPROJ_FILENAME)
+_GEMMA_MODEL_URL = (
+    "https://huggingface.co/lmstudio-community/gemma-4-E2B-it-GGUF/"
+    "resolve/main/gemma-4-E2B-it-Q4_K_M.gguf"
+)
+_GEMMA_MMPROJ_URL = (
+    "https://huggingface.co/lmstudio-community/gemma-4-E2B-it-GGUF/"
+    "resolve/main/mmproj-gemma-4-E2B-it-BF16.gguf"
+)
+_GEMMA_MODEL_SIZE_HINT = "~3.4 GB"
+_GEMMA_MMPROJ_SIZE_HINT = "~990 MB"
+_GEMMA_MODEL_LABEL = "Gemma 4 E2B"
+_AI_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_AI_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
+_AI_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+}
+
+
+def _llama_cpp_pip_index(use_gpu=False):
+    if use_gpu:
+        return "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+    return "https://abetlen.github.io/llama-cpp-python/whl/cpu"
+
+
+def _llama_cpp_install_cmd(use_gpu=False):
+    return (
+        f"pip install llama-cpp-python --prefer-binary "
+        f"--extra-index-url {_llama_cpp_pip_index(use_gpu)}"
+    )
+
+
+_LLAMA_CPP_INSTALL_CMD = _llama_cpp_install_cmd(False)
+
+
+def _llama_cpp_install_hint(use_gpu=False):
+    return (
+        "Install the offline inference engine (prebuilt wheel, no compiler needed):\n\n"
+        f"{_llama_cpp_install_cmd(use_gpu)}\n\n"
+        "Then restart Nova and click Load model again."
+    )
+
+
+def _llama_cpp_unavailable_hint(use_gpu=False):
+    """User-facing message when llama_cpp import/DLL load failed."""
+    lines = [
+        "Nova could not load llama-cpp-python (offline AI engine).",
+        "",
+    ]
+    if _LLAMA_CPP_IMPORT_ERROR:
+        err = _LLAMA_CPP_IMPORT_ERROR.strip()
+        if len(err) > 240:
+            err = err[:237] + "…"
+        lines.extend([f"Details: {err}", ""])
+    if os.name == "nt" and "llama.dll" in _LLAMA_CPP_IMPORT_ERROR.lower():
+        lines.extend([
+            "On Windows this usually means a missing runtime dependency:",
+            "• Install Microsoft Visual C++ Redistributable 2015–2022 (x64)",
+            "• Then reinstall llama-cpp-python with the command below",
+            "",
+        ])
+    lines.extend([
+        _llama_cpp_install_hint(use_gpu).strip(),
+        "",
+        "After reinstalling, fully quit Nova and open it again.",
+    ])
+    return "\n".join(lines)
+
+
+def _reload_llama_cpp():
+    """Re-import llama_cpp after pip install without restarting Nova."""
+    global _LlamaCpp, _Gemma4ChatHandler, _LLAMA_CPP_AVAILABLE, _LLAMA_CPP_IMPORT_ERROR
+    _bootstrap_llama_cpp_dll_path()
+    try:
+        import importlib
+        import llama_cpp
+        importlib.reload(llama_cpp)
+        from llama_cpp import Llama as _LlamaCpp
+        from llama_cpp.llama_chat_format import Gemma4ChatHandler as _Gemma4ChatHandler
+        _LLAMA_CPP_AVAILABLE = True
+        _LLAMA_CPP_IMPORT_ERROR = ""
+        return True
+    except Exception as e:
+        _LlamaCpp = None
+        _Gemma4ChatHandler = None
+        _LLAMA_CPP_AVAILABLE = False
+        _LLAMA_CPP_IMPORT_ERROR = str(e)
+        return False
+
+
+def _nvidia_gpu_detected():
+    """True when NVIDIA drivers respond to nvidia-smi."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        return r.returncode == 0 and bool((r.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def _nvidia_gpu_name():
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if r.returncode == 0:
+            line = (r.stdout or "").strip().splitlines()
+            if line:
+                return line[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _llama_gpu_offload_available():
+    if not _LLAMA_CPP_AVAILABLE:
+        return False
+    try:
+        from llama_cpp import llama_supports_gpu_offload
+        return bool(llama_supports_gpu_offload())
+    except Exception:
+        return False
+
+
+_LLAMA_GPU_WHEEL_URL = (
+    "https://github.com/dougeeai/llama-cpp-python-wheels/releases/download/"
+    "v0.3.20-cuda12.1-sm86/"
+    "llama_cpp_python-0.3.20+cuda12.1.sm86.ampere-py3-none-win_amd64.whl"
+)
+
+
+def _pip_install_llama_cpp(use_gpu=False):
+    if use_gpu and os.name == "nt" and _nvidia_gpu_detected():
+        cmd = [
+            sys.executable, "-m", "pip", "install", _LLAMA_GPU_WHEEL_URL,
+            "--force-reinstall",
+        ]
+    else:
+        cmd = [
+            sys.executable, "-m", "pip", "install", "llama-cpp-python",
+            "--prefer-binary", "--force-reinstall", "--upgrade",
+            "--extra-index-url", _llama_cpp_pip_index(False),
+        ]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "pip install failed").strip()
+        raise RuntimeError(err[-1200:])
+    if not _reload_llama_cpp():
+        raise RuntimeError(_llama_cpp_unavailable_hint(use_gpu))
+    if use_gpu and not _llama_gpu_offload_available():
+        raise RuntimeError(
+            "GPU wheel installed but CUDA offload is still unavailable. "
+            "Install NVIDIA CUDA Toolkit 12.x from developer.nvidia.com, then retry."
+        )
+
+
+def _ai_gpu_usable():
+    return _nvidia_gpu_detected() and _llama_gpu_offload_available()
+
+
+def _ai_inference_device_hint():
+    gpu_name = _nvidia_gpu_name()
+    if _ai_gpu_usable():
+        label = gpu_name or "NVIDIA GPU"
+        return f"GPU ready ({label}). CUDA acceleration is available."
+    if _nvidia_gpu_detected() and not _llama_gpu_offload_available():
+        label = gpu_name or "NVIDIA GPU"
+        return (
+            f"{label} detected, but Nova uses the CPU llama-cpp build — "
+            "that's why your CPU hits ~100% while chatting. "
+            "For GPU: install NVIDIA CUDA Toolkit 12.x, then click "
+            "«Enable GPU (CUDA)» in ⚙ settings, Unload, and Load again."
+        )
+    return (
+        "No usable CUDA GPU detected — CPU mode is recommended. "
+        "Works without NVIDIA drivers."
+    )
+
+
+def _load_ai_chat_settings():
+    cfg = _load_nova_config().get("ai_chat", {})
+    device = cfg.get("device", "cpu")
+    if device == "gpu" and not _ai_gpu_usable():
+        device = "cpu"
+    return {
+        "temperature": float(cfg.get("temperature", 0.7)),
+        "top_p": float(cfg.get("top_p", 0.95)),
+        "top_k": int(cfg.get("top_k", 40)),
+        "max_tokens": int(cfg.get("max_tokens", 2048)),
+        "device": device,
+    }
+
+
+def _save_ai_chat_settings(settings):
+    cfg = _load_nova_config()
+    cfg["ai_chat"] = {
+        "temperature": settings["temperature"],
+        "top_p": settings["top_p"],
+        "top_k": settings["top_k"],
+        "max_tokens": settings.get("max_tokens", 2048),
+        "device": settings["device"],
+    }
+    _save_nova_config(cfg)
+
+
+EXTRAS_AI_FEATURES_DB_KEY = "extras_show_ai_features"
+
+
+def _extras_ai_features_enabled(db):
+    """Whether experimental AI tools appear in Extras (Nova AI Chat + HTML Agent tab)."""
+    return db.get_setting(EXTRAS_AI_FEATURES_DB_KEY, "0") == "1"
+
+
+def _build_multimodal_user_content(text, image_paths, audio_paths):
+    parts = []
+    for path in image_paths:
+        ext = os.path.splitext(path)[1].lower()
+        mime = _AI_MIME.get(ext, "image/png")
+        with open(path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{data}"},
+        })
+    for path in audio_paths:
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": Path(path).resolve().as_uri()},
+        })
+    if text:
+        parts.append({"type": "text", "text": text})
+    if not parts:
+        return ""
+    if len(parts) == 1 and parts[0].get("type") == "text":
+        return text
+    return parts
+
+
+def _nova_md_to_html(text, inline_code_color="#a5b4fc", block_code_color="#cdd6f4"):
+    """Markdown → rich HTML for AI chat (headings, code, lists, bold, italic, rules)."""
+    import re
+    if not text:
+        return ""
+
+    # ── Save fenced code blocks ──────────────────────────────────────────────
+    code_blocks = []
+
+    def _save_code(m):
+        lang = (m.group(1) or "").strip()
+        body = m.group(2) or ""
+        code_blocks.append((lang, body))
+        return f"\0CODE{len(code_blocks) - 1}\0"
+
+    s = re.sub(r"```([^\n]*)\n?(.*?)```", _save_code, text, flags=re.DOTALL)
+
+    # ── Save inline code ─────────────────────────────────────────────────────
+    inline_codes = []
+
+    def _save_inline(m):
+        inline_codes.append(m.group(1))
+        return f"\0INLINE{len(inline_codes) - 1}\0"
+
+    s = re.sub(r"`([^`\n]+)`", _save_inline, s)
+
+    # ── Escape HTML in the prose (not code) ─────────────────────────────────
+    s = html.escape(s)
+
+    # ── Inline formatting ────────────────────────────────────────────────────
+    s = re.sub(r"\*\*\*(.+?)\*\*\*", r"<b><i>\1</i></b>", s)
+    s = re.sub(r"\*\*(.+?)\*\*",     r"<b>\1</b>",         s)
+    s = re.sub(r"__(.+?)__",         r"<b>\1</b>",         s)
+    s = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", s)
+    s = re.sub(r"~~(.+?)~~",         r"<s>\1</s>",         s)
+
+    # ── Headings ─────────────────────────────────────────────────────────────
+    s = re.sub(r"(?m)^# (.+)$",
+               r"<div style='font-size:17px;font-weight:700;margin:14px 0 6px;'>\1</div>", s)
+    s = re.sub(r"(?m)^## (.+)$",
+               r"<div style='font-size:15px;font-weight:700;margin:12px 0 5px;'>\1</div>", s)
+    s = re.sub(r"(?m)^### (.+)$",
+               r"<div style='font-size:13px;font-weight:700;margin:10px 0 4px;'>\1</div>", s)
+
+    # ── Horizontal rule ──────────────────────────────────────────────────────
+    s = re.sub(r"(?m)^[-*_]{3,}$",
+               r"<hr style='border:none;border-top:1px solid rgba(128,128,128,0.25);margin:10px 0;'/>", s)
+
+    # ── Block quotes ─────────────────────────────────────────────────────────
+    s = re.sub(r"(?m)^&gt; (.+)$",
+               r"<div style='border-left:3px solid rgba(128,128,128,0.4);padding-left:10px;"
+               r"margin:4px 0;color:rgba(180,180,180,0.85);'>\1</div>", s)
+
+    # ── Bullet lists ─────────────────────────────────────────────────────────
+    s = re.sub(r"(?m)^[-*\u2022] (.+)$",
+               r"<div style='margin:2px 0 2px 6px;'>&#8226;&nbsp;\1</div>", s)
+
+    # ── Numbered lists ───────────────────────────────────────────────────────
+    counter = [0]
+
+    def _num_item(m):
+        counter[0] += 1
+        return f"<div style='margin:2px 0 2px 6px;'>{counter[0]}.&nbsp;{m.group(1)}</div>"
+
+    s = re.sub(r"(?m)^\d+\. (.+)$", _num_item, s)
+
+    # ── Paragraph breaks ─────────────────────────────────────────────────────
+    s = s.replace("\n\n", "<br><br>")
+    s = s.replace("\n", "<br>")
+
+    # ── Restore inline code ──────────────────────────────────────────────────
+    for i, code in enumerate(inline_codes):
+        esc = html.escape(code)
+        s = s.replace(
+            f"\0INLINE{i}\0",
+            f'<code style="background:rgba(0,0,0,0.35);color:{inline_code_color};'
+            f'padding:1px 6px;border-radius:5px;font-family:Consolas,\'Courier New\',monospace;'
+            f'font-size:12.5px;">{esc}</code>',
+        )
+
+    # ── Restore fenced code blocks ───────────────────────────────────────────
+    for i, (lang, code) in enumerate(code_blocks):
+        esc = html.escape(code.strip())
+        lang_badge = (
+            f'<div style="font-size:10px;font-family:Consolas,monospace;color:rgba(200,200,200,0.55);'
+            f'margin-bottom:6px;letter-spacing:1px;">{html.escape(lang.upper())}</div>'
+            if lang else ""
+        )
+        s = s.replace(
+            f"\0CODE{i}\0",
+            f'<div style="background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.08);'
+            f'border-radius:10px;padding:12px 14px;margin:8px 0;">'
+            f"{lang_badge}"
+            f'<pre style="margin:0;white-space:pre-wrap;font-family:Consolas,\'Courier New\',monospace;'
+            f'font-size:12.5px;line-height:1.55;color:{block_code_color};">{esc}</pre></div>',
+        )
+    return s
+
 
 SUPPORTED_FORMATS = [".aac", ".mp3", ".ogg", ".wav", ".flac", ".m4a"]
 SUPPORTED_VIDEO_FORMATS = [".mp4", ".mkv", ".avi", ".gif", ".webm", ".mov"]
@@ -191,7 +585,7 @@ _BB_BLOCK_COLORS = [
     ("#7C3AED", "#A855F7"),
     ("#0EA5E9", "#38BDF8"),
     ("#10B981", "#34D399"),
-    ("#F59E0B", "#FCD34D"),
+    ("#D946EF", "#E879F9"),
     ("#EF4444", "#F87171"),
     ("#EC4899", "#F472B6"),
     ("#6366F1", "#818CF8"),
@@ -721,6 +1115,12 @@ _TRANSLATIONS = {
             "Ctrl+I       — Import Files\n"
             "Delete       — Remove Song from View\n"
             "F5           — Refresh Library\n"
+            "F11          — Fullscreen toggle\n"
+            "\n"
+            "Media keys (Play/Pause, Next, Prev, Stop, Vol ±, Mute):\n"
+            "  In Nova: always active when Nova is focused\n"
+            "  Global (Windows): Settings → Playback → Global Media Keys\n"
+            "  Works even when another app or game has focus\n"
         ),
         # Status bar / misc
         "Media Browser status": "Media Browser  ·  YouTube, Vimeo, SoundCloud, Twitch, Bandcamp, …",
@@ -919,6 +1319,11 @@ _TRANSLATIONS = {
             "Strg+I       — Dateien importieren\n"
             "Entf         — Song aus Ansicht entfernen\n"
             "F5           — Bibliothek aktualisieren\n"
+            "\n"
+            "Medientasten (Play/Pause, Weiter, Zurück, Stopp, Laut ±, Stumm):\n"
+            "  In Nova: aktiv wenn Nova im Fokus ist\n"
+            "  Global (Windows): Einstellungen → Wiedergabe → Globale Medientasten\n"
+            "  Funktioniert auch wenn ein anderes Fenster im Fokus ist\n"
         ),
         # Status bar / misc
         "Media Browser status": "Medienbrowser  ·  YouTube, Vimeo, SoundCloud, Twitch, Bandcamp, …",
@@ -1351,7 +1756,7 @@ THEMES = {
         "bg": "#002b36", "sidebar": "#00212b", "panel": "#001a22",
         "card": "#073642", "accent": "#268bd2", "accent2": "#2aa198",
         "text": "#839496", "subtext": "#586e75", "border": "#0d414e",
-        "green": "#859900", "red": "#dc322f", "highlight": "#268bd233",
+        "green": "#2aa198", "red": "#dc322f", "highlight": "#268bd233",
     },
     "Light": {
         "bg": "#f6f8fa", "sidebar": "#eaeef2", "panel": "#f0f2f5",
@@ -1361,9 +1766,9 @@ THEMES = {
     },
     "Warm Sepia": {
         "bg": "#1c1510", "sidebar": "#16110c", "panel": "#120e0a",
-        "card": "#261d15", "accent": "#d4a657", "accent2": "#e8c175",
-        "text": "#f0e4cc", "subtext": "#9a7d5a", "border": "#3d2e1e",
-        "green": "#7dba4e", "red": "#e05c4a", "highlight": "#d4a65733",
+        "card": "#261d15", "accent": "#c9785a", "accent2": "#d4917a",
+        "text": "#e8ddd4", "subtext": "#a08070", "border": "#3d2e1e",
+        "green": "#6aab7a", "red": "#e05c4a", "highlight": "#c9785a33",
     },
     "Monochrome": {
         "bg": "#1a1a1a", "sidebar": "#141414", "panel": "#111111",
@@ -1391,6 +1796,101 @@ THEMES = {
         "_liquid_glass": True,
     },
 }
+
+# Cool-only accents for AI chat, HTML agent, and Extras (no yellow/gold/neon-amber).
+_AI_UI_DEFAULT = {
+    "accent": "#5b8dee",
+    "accent2": "#8b5cf6",
+    "code_inline": "#a5b4fc",
+    "code_block": "#cdd6f4",
+}
+
+
+def _hex_to_rgb(hex_color):
+    h = (hex_color or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        return None
+    try:
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return None
+
+
+def _color_is_yellow_neon(hex_color):
+    """True for yellow, gold, amber, orange, olive, and neon warm tones."""
+    rgb = _hex_to_rgb(hex_color)
+    if not rgb:
+        return False
+    r, g, b = rgb
+    if r > 210 and g > 210 and b < 130:
+        return True
+    if r > 200 and g > 160 and b < 90:
+        return True
+    if r > 200 and 110 < g < 215 and b < 120:
+        return True
+    if r > 150 and g > 100 and b < 80:
+        return True
+    try:
+        import colorsys
+        hue, sat, val = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        hue_deg = hue * 360
+        if 15 <= hue_deg <= 75 and sat > 0.2 and val > 0.3:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _color_is_cool_accent(hex_color):
+    """Blue / cyan / purple / teal accents only."""
+    rgb = _hex_to_rgb(hex_color)
+    if not rgb:
+        return False
+    try:
+        import colorsys
+        hue, sat, val = colorsys.rgb_to_hsv(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)
+        hue_deg = hue * 360
+        return (165 <= hue_deg <= 290 or 130 <= hue_deg <= 165) and sat > 0.15 and val > 0.25
+    except Exception:
+        return False
+
+
+def _ai_ui_palette(theme=None):
+    """Accent palette for AI/extras surfaces — cool tones only, never warm/yellow."""
+    t = theme or THEMES["Midnight"]
+    accent = t.get("accent", _AI_UI_DEFAULT["accent"])
+    accent2 = t.get("accent2", accent)
+    if _color_is_yellow_neon(accent) or not _color_is_cool_accent(accent):
+        accent = _AI_UI_DEFAULT["accent"]
+    if _color_is_yellow_neon(accent2) or not _color_is_cool_accent(accent2):
+        accent2 = _AI_UI_DEFAULT["accent2"]
+    return {
+        "accent": accent,
+        "accent2": accent2,
+        "code_inline": _AI_UI_DEFAULT["code_inline"],
+        "code_block": _AI_UI_DEFAULT["code_block"],
+        "highlight": f"{accent}22",
+        "surface": f"{accent}14",
+        "surface_border": f"{accent}44",
+        "bubble_ai_bg": "rgba(22, 28, 42, 0.92)",
+        "bubble_ai_border": "rgba(91, 141, 238, 0.28)",
+    }
+
+
+def _theme_for_ai_ui(base_theme):
+    """Merge a base theme with the AI-safe accent palette."""
+    pal = _ai_ui_palette(base_theme)
+    merged = dict(base_theme)
+    merged["accent"] = pal["accent"]
+    merged["accent2"] = pal["accent2"]
+    merged["highlight"] = pal["highlight"]
+    merged["_ai_surface"] = pal["surface"]
+    merged["_ai_surface_border"] = pal["surface_border"]
+    merged["_ai_bubble_ai_bg"] = pal["bubble_ai_bg"]
+    merged["_ai_bubble_ai_border"] = pal["bubble_ai_border"]
+    return merged
 
 FONTS = [
     # ── Sans-Serif ──────────────────────────────────────────────────────────
@@ -4090,7 +4590,7 @@ class SnakeWindow(QDialog):
 
         title = "🐍  SNAKE"
         p.setFont(ft)
-        hue = int(self._anim * 60) % 360
+        hue = 200 + int(self._anim * 50) % 70  # cyan → purple only (no yellow band)
         p.setPen(QColor.fromHsv(hue, 110, 255, 210))
         fm = QFontMetrics(ft)
         tw = fm.horizontalAdvance(title)
@@ -4232,7 +4732,7 @@ class SnakeWindow(QDialog):
         fh=QFont("SF Pro Display,Segoe UI,Arial",9)
         fh.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,1.5)
 
-        p.setFont(ft); p.setPen(QColor("#f0c040"))
+        p.setFont(ft); p.setPen(QColor("#38f5c8"))
         fm=QFontMetrics(ft); tw=fm.horizontalAdvance(title)
         p.drawText(px+(pw-tw)//2, py+48, title)
         if subtitle:
@@ -4774,7 +5274,7 @@ import hashlib as _hashlib
 import urllib.request as _urllib_req
 
 _NOVA_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova_config.json")
-_NOVA_VERSION = "7.1.4"
+_NOVA_VERSION = "7.1.5"
 _NOVA_UPDATE_URL = (
     "https://raw.githubusercontent.com/NovaX7-Universal/NovaX7/main/NovaX7_7_1_0.py"
 )
@@ -5257,6 +5757,21 @@ class SettingsDialog(QDialog):
             self.discord_rpc.setToolTip("pypresence nicht installiert – führe aus:\npip install pypresence")
         play_layout.addRow("Discord Rich Presence:", self.discord_rpc)
 
+        self.global_media_keys = QCheckBox()
+        enabled_default = sys.platform == "win32"
+        self.global_media_keys.setChecked(
+            db.get_setting("global_media_keys", "1" if enabled_default else "0") == "1"
+        )
+        self.global_media_keys.setToolTip(
+            "Steuert Nova mit den Medientasten der Tastatur (Play/Pause, Weiter, …)\n"
+            "auch wenn ein anderes Programm im Vordergrund ist.\n"
+            "Nur Windows."
+        )
+        if sys.platform != "win32":
+            self.global_media_keys.setEnabled(False)
+            self.global_media_keys.setToolTip("Globale Medientasten sind nur unter Windows verfügbar.")
+        play_layout.addRow("Global Media Keys:", self.global_media_keys)
+
         play_tab.setLayout(play_layout)
         tabs.addTab(play_tab, "Playback")
 
@@ -5305,6 +5820,18 @@ class SettingsDialog(QDialog):
             "Delete       — Remove Song from View\n"
             "F5           — Refresh Library\n"
             "F11          — Fenster Vollbild ein/aus\n"
+            "\n"
+            "Media keys (keyboard audio buttons):\n"
+            "  Play/Pause   — Toggle playback\n"
+            "  Next track   — Next song\n"
+            "  Previous     — Previous song\n"
+            "  Stop         — Stop playback\n"
+            "  Volume ±     — Volume up/down\n"
+            "  Mute         — Mute / unmute\n"
+            "\n"
+            "Global media keys (Windows):\n"
+            "  Enable in Settings → Playback → Global Media Keys\n"
+            "  Controls Nova even when another window is focused\n"
         )
         kb_layout.addWidget(shortcuts_text)
         kb_tab.setLayout(kb_layout)
@@ -5353,6 +5880,54 @@ class SettingsDialog(QDialog):
         self._code_status.setWordWrap(True)
         self._code_status.setStyleSheet("font-size: 12px; min-height: 20px;")
         extras_layout.addWidget(self._code_status)
+
+        extras_ai_sep = QFrame()
+        extras_ai_sep.setFrameShape(QFrame.Shape.HLine)
+        extras_ai_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        extras_layout.addWidget(extras_ai_sep)
+
+        extras_ai_title = QLabel("🤖  Experimental AI in Extras")
+        extras_ai_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        extras_layout.addWidget(extras_ai_title)
+
+        extras_ai_desc = QLabel(
+            "Nova AI Chat and the HTML Viewer Agent tab are still in development. "
+            "Slide right to show them on the Extras dashboard; slide left to hide them."
+        )
+        extras_ai_desc.setWordWrap(True)
+        extras_ai_desc.setStyleSheet("color: #888; font-size: 12px;")
+        extras_layout.addWidget(extras_ai_desc)
+
+        ai_slider_row = QHBoxLayout()
+        ai_slider_row.setSpacing(10)
+        ai_hidden_lbl = QLabel("Hidden")
+        ai_hidden_lbl.setStyleSheet("color: #888; font-size: 11px; min-width: 42px;")
+        self.extras_ai_slider = QSlider(Qt.Orientation.Horizontal)
+        self.extras_ai_slider.setRange(0, 1)
+        self.extras_ai_slider.setPageStep(1)
+        self.extras_ai_slider.setSingleStep(1)
+        self.extras_ai_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.extras_ai_slider.setTickInterval(1)
+        self.extras_ai_slider.setValue(
+            1 if db.get_setting(EXTRAS_AI_FEATURES_DB_KEY, "0") == "1" else 0
+        )
+        self.extras_ai_slider.setToolTip(
+            "Left = hide Nova AI Chat and the HTML Viewer Agent tab\n"
+            "Right = show unfinished AI tools in Extras"
+        )
+        ai_visible_lbl = QLabel("Visible")
+        ai_visible_lbl.setStyleSheet("color: #888; font-size: 11px; min-width: 42px;")
+        ai_slider_row.addWidget(ai_hidden_lbl)
+        ai_slider_row.addWidget(self.extras_ai_slider, 1)
+        ai_slider_row.addWidget(ai_visible_lbl)
+        extras_layout.addLayout(ai_slider_row)
+
+        self._extras_ai_status = QLabel("")
+        self._extras_ai_status.setWordWrap(True)
+        self._extras_ai_status.setStyleSheet("font-size: 12px; min-height: 18px;")
+        extras_layout.addWidget(self._extras_ai_status)
+        self.extras_ai_slider.valueChanged.connect(self._update_extras_ai_slider_label)
+        self._update_extras_ai_slider_label()
 
         extras_layout.addStretch()
         extras_tab.setLayout(extras_layout)
@@ -5559,11 +6134,27 @@ class SettingsDialog(QDialog):
         self.extract_covers.setChecked(True)
         if self.discord_rpc.isEnabled():
             self.discord_rpc.setChecked(False)
+        self.global_media_keys.setChecked(sys.platform == "win32")
 
         # ── Library ───────────────────────────────────────────────────────────
         self.watch_folder.setText("")
         self.remember_pos.setChecked(False)
         self.browser_home_url.setText("https://www.google.com")
+        self.extras_ai_slider.setValue(0)
+        self._update_extras_ai_slider_label()
+
+    def _update_extras_ai_slider_label(self, _value=None):
+        visible = self.extras_ai_slider.value() == 1
+        if visible:
+            self._extras_ai_status.setStyleSheet("color: #8892b0; font-size: 12px; min-height: 18px;")
+            self._extras_ai_status.setText(
+                "Nova AI Chat and the HTML Viewer Agent tab will appear in Extras."
+            )
+        else:
+            self._extras_ai_status.setStyleSheet("color: #8892b0; font-size: 12px; min-height: 18px;")
+            self._extras_ai_status.setText(
+                "AI tools stay hidden — HTML Viewer Code and Preview tabs remain available."
+            )
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Watch Folder")
@@ -5596,12 +6187,20 @@ class SettingsDialog(QDialog):
         self.db.set_setting("default_volume", self.default_vol.value())
         self.db.set_setting("extract_covers", "1" if self.extract_covers.isChecked() else "0")
         self.db.set_setting("discord_rpc", "1" if self.discord_rpc.isChecked() else "0")
+        self.db.set_setting(
+            "global_media_keys",
+            "1" if self.global_media_keys.isChecked() else "0",
+        )
         self.db.set_setting("watch_folder", self.watch_folder.text())
         self.db.set_setting("remember_pos", "1" if self.remember_pos.isChecked() else "0")
         url = self.browser_home_url.text().strip()
         if url and not url.startswith("http"):
             url = "https://" + url
         self.db.set_setting("browser_home_url", url or "https://www.google.com")
+        self.db.set_setting(
+            EXTRAS_AI_FEATURES_DB_KEY,
+            "1" if self.extras_ai_slider.value() == 1 else "0",
+        )
         self.accept()
 
     def _redeem_code(self):
@@ -5677,6 +6276,61 @@ class GlobalHotkeyThread(QThread):
             self.msleep(20)
             
         ctypes.windll.user32.UnregisterHotKey(None, HOTKEY_ID)
+
+
+class GlobalMediaKeysThread(QThread):
+    """Register Windows media-key VK codes globally (works when Nova is not focused)."""
+    triggered = pyqtSignal(str)
+
+    _ACTIONS = (
+        ("play_pause", 0xB3),   # VK_MEDIA_PLAY_PAUSE
+        ("next",       0xB0),   # VK_MEDIA_NEXT_TRACK
+        ("prev",       0xB1),   # VK_MEDIA_PREV_TRACK
+        ("stop",       0xB2),   # VK_MEDIA_STOP
+        ("vol_up",     0xAF),   # VK_VOLUME_UP
+        ("vol_down",   0xAE),   # VK_VOLUME_DOWN
+        ("mute",       0xAD),   # VK_VOLUME_MUTE
+    )
+    _BASE_ID = 3100
+    _MOD_NOREPEAT = 0x4000
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        registered = {}
+        for i, (action, vk) in enumerate(self._ACTIONS):
+            hid = self._BASE_ID + i
+            user32.UnregisterHotKey(None, hid)
+            if user32.RegisterHotKey(None, hid, self._MOD_NOREPEAT, vk):
+                registered[hid] = action
+
+        if not registered:
+            return
+
+        msg = wintypes.MSG()
+        while self.running:
+            if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                if msg.message == 0x0312 and msg.wParam in registered:
+                    self.triggered.emit(registered[msg.wParam])
+                elif msg.message == 0x0012:
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            self.msleep(20)
+
+        for hid in registered:
+            user32.UnregisterHotKey(None, hid)
 
 
 # ──────────────────────────── AUTOCLICKER THREAD ────────────────────────────
@@ -5870,9 +6524,8 @@ class AutoclickerPanel(QWidget):
         layout.addWidget(scroll)
 
     def apply_theme_styles(self):
-        t = self.window().theme if hasattr(self.window(), "theme") else {
-            "card": "#181824", "border": "#27273a", "accent": "#5b8dee", "text": "#e8ecf4"
-        }
+        t = self.window().theme if hasattr(self.window(), "theme") else THEMES["Midnight"]
+        pal = _ai_ui_palette(t)
         card_style = f"""
             QFrame#extra_card {{
                 background-color: {t['card']};
@@ -5888,9 +6541,8 @@ class AutoclickerPanel(QWidget):
         self.update_toggle_btn_style()
 
     def update_toggle_btn_style(self):
-        t = self.window().theme if hasattr(self.window(), "theme") else {
-            "accent": "#5b8dee", "border": "#27273a", "text": "#e8ecf4"
-        }
+        t = self.window().theme if hasattr(self.window(), "theme") else THEMES["Midnight"]
+        pal = _ai_ui_palette(t)
         is_running = self.active_thread is not None
         if is_running:
             style = """
@@ -5908,14 +6560,14 @@ class AutoclickerPanel(QWidget):
         else:
             style = f"""
                 QPushButton#action_btn {{
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {t['accent']}, stop:1 {t.get('accent2', t['accent'])});
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {pal['accent']}, stop:1 {pal['accent2']});
                     color: white;
                     border: none;
                     border-radius: 8px;
                     font-weight: bold;
                 }}
                 QPushButton#action_btn:hover {{
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {t.get('accent2', t['accent'])}, stop:1 {t['accent']});
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {pal['accent2']}, stop:1 {pal['accent']});
                 }}
             """
         self.toggle_btn.setStyleSheet(style)
@@ -5997,6 +6649,2730 @@ class AutoclickerPanel(QWidget):
         super().closeEvent(event)
 
 
+# ──────────────────────────── HTML VIEWER PANEL ────────────────────────────
+
+_HTML_VIEWER_STARTER = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My Page</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f0f12;
+      color: #f0f0f5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    h1 { font-size: 2rem; }
+  </style>
+</head>
+<body>
+  <div>
+    <h1>Hello!</h1>
+    <p>Paste HTML here, then click <b>Run</b> or press Ctrl+Enter.</p>
+  </div>
+</body>
+</html>"""
+
+_HTML_AGENT_THINK_SYSTEM = """You are a planning assistant for a web coding agent in NovaX7 HTML Viewer.
+
+Analyze the user message and the project state. Output EXACTLY this format (no other text):
+
+MODE: edit
+or
+MODE: create
+
+PLAN:
+- (1-4 short bullets: what will change; for edits list ONLY the delta)
+
+REQUEST:
+(one paragraph: precise instruction for the coder)
+
+Rules:
+- MODE: create ONLY if there is no real project yet OR the user explicitly wants a brand-new page from scratch.
+- MODE: edit for ANY change, fix, addition, styling tweak, or feature on an existing page.
+- PLAN bullets must be minimal — never say "rewrite entire file".
+- REQUEST must preserve all unrelated existing behavior and layout."""
+
+_HTML_AGENT_CREATE_SYSTEM = """You are an expert web developer building a NEW HTML page for NovaX7 HTML Viewer.
+
+You MUST output exactly one ```html code block containing a complete working page.
+- Include <!DOCTYPE html>, <html>, <head>, <body>.
+- Put ALL CSS inside <style> tags and ALL JavaScript inside <script> tags in the same file.
+- No explanations before the code block. No text after SUMMARY line.
+- The page must run offline in a browser when pasted into Nova.
+- After the closing ``` add one line: SUMMARY: <what you built in under 15 words>"""
+
+_HTML_AGENT_EDIT_SYSTEM = """You are a surgical code editor for NovaX7 HTML Viewer.
+The user wants a SMALL change to an EXISTING file. You must NOT rewrite the whole project.
+
+Output ONLY search/replace patches using this EXACT format (repeat for each change):
+
+<<<<<<< SEARCH
+(paste exact lines from CURRENT PROJECT HTML — must match character-for-character)
+=======
+(the new lines that replace ONLY that block)
+>>>>>>> REPLACE
+
+Rules:
+- Output 1 to 6 patches maximum. Touch only what the request needs.
+- Every SEARCH block must be copied verbatim from the current file (same spaces, quotes, line breaks).
+- Keep all unrelated HTML, CSS, JS, ids, classes, and structure unchanged.
+- Do NOT output a full ```html document unless a patch is impossible — patches are required.
+- If adding new CSS/JS, patch inside existing <style>/<script> or add small new blocks near related code.
+- After all patches, one line: SUMMARY: <what you changed in plain English>"""
+
+
+def _is_agent_starter_html(html):
+    a = (html or "").strip()
+    b = _HTML_VIEWER_STARTER.strip()
+    if a == b:
+        return True
+    if len(a) < 420 and "Hello!" in a and "Paste HTML here" in a:
+        return True
+    return False
+
+
+def _html_agent_context_snippet(html, max_chars=14000):
+    """Send full file when possible; otherwise head + tail with a gap marker."""
+    html = html or ""
+    if len(html) <= max_chars:
+        return html
+    head = max_chars * 2 // 3
+    tail = max_chars - head - 80
+    return (
+        html[:head]
+        + "\n<!-- … middle of file omitted for context — do NOT delete unseen code … -->\n"
+        + html[-tail:]
+    )
+
+
+def _apply_agent_patches(html, text):
+    """Apply SEARCH/REPLACE blocks. Returns (new_html, applied_count, errors)."""
+    import re
+    if not html or not text:
+        return None, 0, ["No patches found."]
+    text = _strip_agent_tail(text)
+
+    patterns = (
+        r"<<<<<<< SEARCH\r?\n(.*?)\r?\n=======\r?\n(.*?)\r?\n>>>>>>> REPLACE",
+        r"<<<<<< SEARCH\r?\n(.*?)\r?\n=======\r?\n(.*?)\r?\n>>>>>> REPLACE",
+        r"<<<< SEARCH\r?\n(.*?)\r?\n=======\r?\n(.*?)\r?\n>>>> REPLACE",
+        r"### SEARCH\r?\n(.*?)\r?\n### REPLACE\r?\n(.*?)(?:\r?\n### END|\Z)",
+    )
+    blocks = []
+    for pat in patterns:
+        blocks = re.findall(pat, text, re.DOTALL | re.IGNORECASE)
+        if blocks:
+            break
+    if not blocks:
+        return None, 0, ["No SEARCH/REPLACE blocks in the response."]
+
+    result = html
+    applied = 0
+    errors = []
+
+    def _norm(s):
+        return s.replace("\r\n", "\n").replace("\r", "\n")
+
+    def _try_replace(src, search, replace):
+        if search in src:
+            return src.replace(search, replace, 1), True
+        ns, nr = _norm(search), _norm(replace)
+        nsrc = _norm(src)
+        if ns in nsrc:
+            return _norm(src).replace(ns, nr, 1), True
+        for trim_s, trim_r in (
+            (search.strip(), replace.strip()),
+            (search.strip("\n"), replace.strip("\n")),
+        ):
+            if trim_s and trim_s in src:
+                return src.replace(trim_s, trim_r, 1), True
+            if trim_s and trim_s in nsrc:
+                return _norm(src).replace(trim_s, _norm(trim_r), 1), True
+        # Single-line fuzzy: collapse internal whitespace
+        if "\n" not in search.strip() and len(search.strip()) > 4:
+            import re as _re
+            sq = _re.sub(r"\s+", " ", search.strip())
+            for line in src.splitlines():
+                if _re.sub(r"\s+", " ", line.strip()) == sq:
+                    return src.replace(line, replace.strip(), 1), True
+        return src, False
+
+    for i, (search, replace) in enumerate(blocks, 1):
+        new_result, ok = _try_replace(result, search, replace)
+        if ok:
+            result = new_result
+            applied += 1
+        else:
+            preview = search.strip().splitlines()
+            hint = preview[0][:60] if preview else "?"
+            errors.append(f"Patch {i} did not match (starts: {hint}…)")
+    return result, applied, errors
+
+
+def _strip_agent_tail(text):
+    """Remove SUMMARY / trailing chatter after the code block."""
+    import re
+    if not text:
+        return ""
+    text = re.sub(r"\nSUMMARY:\s*.+$", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    return text
+
+
+def _wrap_html_fragment(text):
+    """Wrap bare HTML/CSS/JS fragments in a minimal document shell."""
+    t = (text or "").strip()
+    if not t or "<html" in t.lower() or "<!doctype" in t.lower():
+        return t
+    if any(tag in t.lower() for tag in ("<head", "<body", "<style", "<script", "<div", "<canvas")):
+        return (
+            "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+            "  <meta charset=\"utf-8\">\n"
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "  <title>Nova Preview</title>\n"
+            "</head>\n<body>\n"
+            f"{t}\n"
+            "</body>\n</html>"
+        )
+    return t
+
+
+def _extract_html_agent_code(text):
+    import re
+    if not text:
+        return ""
+    text = _strip_agent_tail(text.strip())
+
+    patterns = (
+        r"```html\s*(.*?)\s*```",
+        r"```htm\s*(.*?)\s*```",
+        r"```xml\s*(.*?)\s*```",
+        r"```\s*(<!DOCTYPE[\s\S]*?)\s*```",
+        r"```\s*(<html[\s\S]*?</html>)\s*```",
+        r"```[^\n]*\n(<!DOCTYPE[\s\S]*?</html>)\s*```",
+        r"```[^\n]*\n(<html[\s\S]*?</html>)\s*```",
+        # Truncated stream — opening fence but no closing ```
+        r"```html\s*\n([\s\S]+)$",
+        r"```\s*\n(<!DOCTYPE[\s\S]+)$",
+        r"```\s*\n(<html[\s\S]+)$",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if m:
+            body = m.group(1).strip()
+            if len(body) > 40 and ("<" in body and ">" in body):
+                return _wrap_html_fragment(body)
+
+    low = text.lower()
+    for marker in ("<!doctype", "<html"):
+        idx = low.find(marker)
+        if idx >= 0:
+            tail = text[idx:]
+            end = tail.lower().rfind("</html>")
+            if end >= 0:
+                return tail[: end + len("</html>")].strip()
+            # Truncated — still usable if substantial
+            if len(tail) > 120:
+                return _wrap_html_fragment(tail.strip())
+
+    # Last resort: largest HTML-ish region in the response
+    m = re.search(r"(<(?:!DOCTYPE|html|head|body|style|script|div|canvas)[\s\S]{80,})", text, re.IGNORECASE)
+    if m:
+        return _wrap_html_fragment(m.group(1).strip())
+    return ""
+
+
+def _extract_agent_summary(text):
+    import re
+    m = re.search(r"SUMMARY:\s*(.+)", text, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return ""
+    return m.group(1).strip().split("\n")[0].strip()
+
+
+def _parse_agent_think_response(text, user_prompt, current_html):
+    """Parse MODE / PLAN / REQUEST from think phase; fall back to heuristics."""
+    import re
+    raw = (text or "").strip()
+    mode = "create" if _is_agent_starter_html(current_html) else "edit"
+    plan = ""
+    request = raw or user_prompt
+
+    mode_m = re.search(r"MODE:\s*(create|edit)\b", raw, re.IGNORECASE)
+    if mode_m:
+        mode = mode_m.group(1).lower()
+
+    plan_m = re.search(r"PLAN:\s*(.*?)(?:\nREQUEST:|\Z)", raw, re.DOTALL | re.IGNORECASE)
+    if plan_m:
+        plan = plan_m.group(1).strip()
+
+    req_m = re.search(r"REQUEST:\s*(.+)", raw, re.DOTALL | re.IGNORECASE)
+    if req_m:
+        request = req_m.group(1).strip()
+
+    if not _is_agent_starter_html(current_html):
+        mode = "edit"
+    create_words = (
+        "from scratch", "new page", "brand new", "start over", "rewrite everything",
+        "make a", "make an", "build a", "build an", "create a", "create an",
+        "write a", "write an", "full working", "entire game", "entire page",
+    )
+    if _is_agent_starter_html(current_html):
+        mode = "create"
+    if any(w in user_prompt.lower() for w in create_words):
+        mode = "create"
+
+    return mode, plan, request
+
+
+def _agent_failure_hint(response_text, mode):
+    """Short diagnostic when parsing failed."""
+    raw = (response_text or "").strip()
+    if not raw:
+        return "The model returned an empty response. Try again or increase Max tokens in Nova AI Chat settings."
+    if len(raw) < 80:
+        return f"The model reply was too short ({len(raw)} chars). Try a clearer prompt or raise Max tokens."
+    if "<<<<<<< SEARCH" in raw or "<<<< SEARCH" in raw:
+        return "Patches were returned but none matched your file — try a smaller, specific change."
+    if "```" in raw and "<" not in raw:
+        return "The model used a code block but no HTML was detected inside it."
+    preview = raw.replace("\n", " ")[:120]
+    return (
+        f"Could not parse HTML from the model output. "
+        f"Try: Open Code tab → click Run on what you have → ask for one small change. "
+        f"(Got: {preview}…)"
+    )
+
+
+def _resolve_agent_output(current_html, response_text, mode):
+    """Turn model output into final HTML. Edit mode prefers patches over full rewrite."""
+    summary = _extract_agent_summary(response_text)
+    mode = (mode or "edit").lower()
+    is_starter = _is_agent_starter_html(current_html)
+
+    if mode == "edit" and current_html and not is_starter:
+        patched, count, errors = _apply_agent_patches(current_html, response_text)
+        if patched is not None and count > 0:
+            note = summary or f"Applied {count} targeted patch{'es' if count != 1 else ''}."
+            return patched, note, "patch", count
+
+        full = _extract_html_agent_code(response_text)
+        min_len = max(200, int(len(current_html) * 0.25))
+        if full and len(full) >= min_len:
+            note = summary or "Updated the project (full file returned by model)."
+            return full, note, "full", 0
+
+        err = "; ".join(errors[:2]) if errors else _agent_failure_hint(response_text, mode)
+        return None, err, "failed", 0
+
+    full = _extract_html_agent_code(response_text)
+    if full and len(full) >= 80:
+        note = summary or "Built a new HTML page."
+        return full, note, "create", 0
+    return None, _agent_failure_hint(response_text, mode), "failed", 0
+
+
+class _HtmlAgentWorker(QThread):
+    """Plan → edit (patches) or create (full HTML), with conversation context."""
+
+    thinking_done = pyqtSignal(str, str, str)   # mode, plan, clarified_request
+    token = pyqtSignal(str)
+    code_ready = pyqtSignal(str, str, str)      # html, summary, method
+    failed = pyqtSignal(str)
+    status = pyqtSignal(str)
+
+    _MIN_THINK_SEC = 2.0
+
+    def __init__(
+        self, llm, user_prompt, current_html, agent_history,
+        temperature, top_p, top_k, max_tokens,
+    ):
+        super().__init__()
+        self.llm = llm
+        self.user_prompt = user_prompt
+        self.current_html = current_html or ""
+        self.agent_history = list(agent_history or [])
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.max_tokens = max_tokens
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+        self.requestInterruption()
+
+    def _chat(self, messages, max_tokens, temperature, stream=False):
+        return self.llm.create_chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repeat_penalty=1.08,
+            stream=stream,
+        )
+
+    def _stream_collect(self, messages, max_tokens, temperature):
+        stream = self._chat(messages, max_tokens, temperature, stream=True)
+        buf = ""
+        for chunk in stream:
+            if self._stop or self.isInterruptionRequested():
+                return None
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            piece = delta.get("content") or ""
+            if piece:
+                buf += piece
+                self.token.emit(piece)
+        return buf
+
+    def run(self):
+        import time
+        t0 = time.time()
+        try:
+            has_project = not _is_agent_starter_html(self.current_html)
+            project_note = (
+                f"The user already has a {len(self.current_html.splitlines())}-line HTML project."
+                if has_project else "The project is still the default starter template."
+            )
+
+            self.status.emit("Thinking — planning your change…")
+            think_user = (
+                f"{project_note}\n\n"
+                f"USER MESSAGE:\n{self.user_prompt}\n\n"
+                "Decide edit vs create and write the PLAN and REQUEST blocks."
+            )
+            if self.agent_history:
+                recent = self.agent_history[-4:]
+                hist_lines = []
+                for h in recent:
+                    hist_lines.append(f"{h.get('role', 'user').upper()}: {h.get('content', '')[:400]}")
+                think_user = "RECENT AGENT CHAT:\n" + "\n".join(hist_lines) + "\n\n" + think_user
+
+            think_resp = self._chat(
+                [
+                    {"role": "system", "content": _HTML_AGENT_THINK_SYSTEM},
+                    {"role": "user", "content": think_user},
+                ],
+                max_tokens=450,
+                temperature=0.15,
+                stream=False,
+            )
+            if self._stop:
+                return
+
+            think_text = (
+                (think_resp.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                or ""
+            ).strip()
+            mode, plan, clarified = _parse_agent_think_response(
+                think_text, self.user_prompt, self.current_html
+            )
+            self.thinking_done.emit(mode, plan, clarified)
+
+            wait = self._MIN_THINK_SEC - (time.time() - t0)
+            if wait > 0 and not self._stop:
+                time.sleep(wait)
+            if self._stop:
+                return
+
+            snippet = _html_agent_context_snippet(self.current_html)
+            if mode == "edit":
+                self.status.emit("Applying targeted edits (search/replace)…")
+                system = _HTML_AGENT_EDIT_SYSTEM
+                code_temp = min(0.22, max(0.08, self.temperature * 0.35))
+                user_msg = (
+                    f"CURRENT PROJECT HTML (copy SEARCH text exactly from here):\n"
+                    f"```html\n{snippet}\n```\n\n"
+                    f"TASK:\n{clarified}\n\n"
+                    f"PLAN TO FOLLOW:\n{plan or '- minimal change only'}"
+                )
+            else:
+                self.status.emit("Building new HTML page…")
+                system = _HTML_AGENT_CREATE_SYSTEM
+                code_temp = min(0.45, max(0.2, self.temperature))
+                user_msg = f"BUILD REQUEST:\n{clarified}"
+
+            buf = self._stream_collect(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_msg},
+                ],
+                self.max_tokens,
+                code_temp,
+            )
+            if self._stop or buf is None:
+                return
+            if not (buf or "").strip():
+                buf = ""
+
+            html_out, summary, method, patch_count = _resolve_agent_output(
+                self.current_html, buf, mode
+            )
+
+            if html_out is None and mode == "edit":
+                # One strict retry — patches only
+                self.status.emit("Retrying with stricter edit instructions…")
+                self.token.emit("\n")
+                retry_buf = self._stream_collect(
+                    [
+                        {"role": "system", "content": _HTML_AGENT_EDIT_SYSTEM},
+                        {"role": "user", "content": (
+                            user_msg
+                            + "\n\nIMPORTANT: Your last attempt failed. "
+                            "Output ONLY <<<<<<< SEARCH / ======= / >>>>>>> REPLACE patches. "
+                            "Copy smaller exact snippets from CURRENT PROJECT HTML."
+                        )},
+                    ],
+                    min(self.max_tokens, 4096),
+                    0.08,
+                )
+                if retry_buf and not self._stop:
+                    html_out, summary, method, patch_count = _resolve_agent_output(
+                        self.current_html, retry_buf, "edit"
+                    )
+
+            if html_out is None and mode == "create":
+                self.status.emit("Retrying — requesting a full HTML file…")
+                self.token.emit("\n")
+                retry_buf = self._stream_collect(
+                    [
+                        {"role": "system", "content": _HTML_AGENT_CREATE_SYSTEM},
+                        {"role": "user", "content": (
+                            f"BUILD THIS (complete ```html file only):\n{clarified}\n\n"
+                            "Start your reply with ```html on the first line. No other text before it."
+                        )},
+                    ],
+                    max(self.max_tokens, 4096),
+                    0.12,
+                )
+                if retry_buf and not self._stop:
+                    html_out, summary, method, patch_count = _resolve_agent_output(
+                        self.current_html, retry_buf, "create"
+                    )
+                    # Last resort: non-streaming single shot (more reliable on small models)
+                    if html_out is None:
+                        self.status.emit("Final attempt (non-streaming)…")
+                        try:
+                            resp = self._chat(
+                                [
+                                    {"role": "system", "content": _HTML_AGENT_CREATE_SYSTEM},
+                                    {"role": "user", "content": (
+                                        f"Output ONLY a ```html code block for:\n{clarified}"
+                                    )},
+                                ],
+                                max(self.max_tokens, 4096),
+                                0.1,
+                                stream=False,
+                            )
+                            if not self._stop:
+                                piece = (
+                                    (resp.get("choices") or [{}])[0]
+                                    .get("message", {})
+                                    .get("content", "")
+                                )
+                                if piece:
+                                    self.token.emit(piece)
+                                    html_out, summary, method, patch_count = _resolve_agent_output(
+                                        self.current_html, piece, "create"
+                                    )
+                        except Exception:
+                            pass
+
+            if html_out is None:
+                self.failed.emit(summary or "Could not apply changes.")
+                return
+
+            if method == "patch" and patch_count:
+                summary = summary or f"Applied {patch_count} patch(es)."
+
+            self.code_ready.emit(html_out, summary, method)
+        except Exception as e:
+            if not self._stop:
+                self.failed.emit(str(e))
+
+
+class HtmlViewerPanel(QWidget):
+    """Edit HTML in a code tab, run it in a separate preview tab (WebEngine)."""
+
+    _STARTER_HTML = _HTML_VIEWER_STARTER
+
+    def __init__(self, extras_panel):
+        super().__init__(extras_panel)
+        self.extras_panel = extras_panel
+        self._current_path = None
+        self._fs_window = None
+        self._fs_esc_shortcut = None
+        self._agent_worker = None
+        self._agent_blocks = []
+        self._agent_history = []
+        self._agent_stream_buf = ""
+        self._agent_busy = False
+        self._agent_scroll_pinned = True
+        self._agent_scroll_guard = False
+        self._agent_think_dots = 0
+        self._agent_think_timer = QTimer(self)
+        self._agent_think_timer.timeout.connect(self._tick_agent_think_animation)
+        self._build_ui()
+        self.apply_theme_styles()
+        self._refresh_agent_controls()
+
+    def _theme(self):
+        w = self.window()
+        base = w.theme if w and hasattr(w, "theme") else THEMES["Midnight"]
+        return _theme_for_ai_ui(base)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        toolbar = QFrame()
+        toolbar.setObjectName("yt_browser_toolbar")
+        toolbar.setFixedHeight(36)
+        tb = QHBoxLayout(toolbar)
+        tb.setContentsMargins(8, 4, 8, 4)
+        tb.setSpacing(8)
+
+        self.open_btn = QPushButton("📂  Open")
+        self.open_btn.setObjectName("toolbar_btn")
+        self.open_btn.setFixedHeight(26)
+        self.open_btn.setToolTip("Open an HTML file into the Code tab")
+        self.open_btn.clicked.connect(self._open_file)
+
+        self.run_btn = QPushButton("▶  Run")
+        self.run_btn.setObjectName("toolbar_btn")
+        self.run_btn.setFixedHeight(26)
+        self.run_btn.setToolTip("Run pasted HTML in the Preview tab (Ctrl+Enter)")
+        self.run_btn.clicked.connect(self._run_html)
+
+        self.reload_btn = QPushButton("↻  Reload")
+        self.reload_btn.setObjectName("toolbar_btn")
+        self.reload_btn.setFixedHeight(26)
+        self.reload_btn.setToolTip("Reload the current preview")
+        self.reload_btn.clicked.connect(self._reload)
+
+        self.fs_btn = QPushButton("⛶  Fullscreen")
+        self.fs_btn.setObjectName("toolbar_btn")
+        self.fs_btn.setFixedHeight(26)
+        self.fs_btn.clicked.connect(self._toggle_fullscreen)
+
+        self.path_lbl = QLabel("Paste HTML in Code tab, then Run")
+        self.path_lbl.setObjectName("time_label")
+        self.path_lbl.setWordWrap(True)
+
+        tb.addWidget(self.open_btn)
+        tb.addWidget(self.run_btn)
+        tb.addWidget(self.reload_btn)
+        tb.addWidget(self.fs_btn)
+        tb.addWidget(self.path_lbl, 1)
+        layout.addWidget(toolbar)
+
+        self._tabs = QTabWidget()
+        self._tabs.setDocumentMode(True)
+
+        # ── Code tab ──────────────────────────────────────────────────────────
+        code_tab = QWidget()
+        code_l = QVBoxLayout(code_tab)
+        code_l.setContentsMargins(0, 0, 0, 0)
+        code_l.setSpacing(0)
+
+        self.code_edit = QTextEdit()
+        self.code_edit.setAcceptRichText(False)
+        self.code_edit.setPlaceholderText("Paste HTML, CSS, and JavaScript here…")
+        self.code_edit.setPlainText(self._STARTER_HTML)
+        self.code_edit.setTabStopDistance(28)
+        self.code_edit.installEventFilter(self)
+        code_l.addWidget(self.code_edit, 1)
+        self._tabs.addTab(code_tab, "📝  Code")
+
+        # ── Preview tab ───────────────────────────────────────────────────────
+        self._preview_tab = QWidget()
+        self._preview_layout = QVBoxLayout(self._preview_tab)
+        self._preview_layout.setContentsMargins(0, 0, 0, 0)
+        self._preview_layout.setSpacing(0)
+
+        self._web_host = QWidget()
+        self._web_host_layout = QVBoxLayout(self._web_host)
+        self._web_host_layout.setContentsMargins(0, 0, 0, 0)
+        self._web_host_layout.setSpacing(0)
+
+        if _WEBENGINE_AVAILABLE:
+            self.web = QWebEngineView()
+            try:
+                ps = self.web.page().settings()
+                ps.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+                ps.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+                ps.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+                ps.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+                ps.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+                ps.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+            except Exception as e:
+                print(f"[Nova] HTML viewer settings error: {e}")
+            self.web.page().fullScreenRequested.connect(self._handle_fullscreen_request)
+            self._web_host_layout.addWidget(self.web)
+
+            self._fs_container = QWidget(None, Qt.WindowType.Window)
+            self._fs_container.setWindowTitle("Nova – HTML Viewer")
+            self._fs_container.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+            self._fs_container.setStyleSheet("background:#000;")
+            _fsl = QVBoxLayout(self._fs_container)
+            _fsl.setContentsMargins(0, 0, 0, 0)
+            _fsl.setSpacing(0)
+            self._fs_esc_shortcut = QShortcut(QKeySequence("Escape"), self._fs_container)
+            self._fs_esc_shortcut.activated.connect(self._exit_fullscreen)
+            self._fs_esc_shortcut.setEnabled(False)
+        else:
+            self.web = None
+            fallback = QLabel(
+                "<b>PyQt6-WebEngine not installed</b><br><br>"
+                "Install with: <code>pip install PyQt6-WebEngine</code>"
+            )
+            fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fallback.setWordWrap(True)
+            fallback.setTextFormat(Qt.TextFormat.RichText)
+            self._web_host_layout.addWidget(fallback, 1)
+            self.open_btn.setEnabled(False)
+            self.run_btn.setEnabled(False)
+            self.reload_btn.setEnabled(False)
+            self.fs_btn.setEnabled(False)
+
+        self._preview_layout.addWidget(self._web_host, 1)
+        self._tabs.addTab(self._preview_tab, "▶  Preview")
+
+        # ── AI Agent tab ──────────────────────────────────────────────────────
+        agent_tab = QWidget()
+        agent_l = QVBoxLayout(agent_tab)
+        agent_l.setContentsMargins(0, 0, 0, 0)
+        agent_l.setSpacing(0)
+
+        self.agent_status = QLabel("")
+        self.agent_status.setWordWrap(True)
+        self.agent_status.setFixedHeight(34)
+        agent_l.addWidget(self.agent_status)
+
+        self.agent_log = QTextBrowser()
+        self.agent_log.setOpenLinks(False)
+        self.agent_log.setFrameShape(QFrame.Shape.NoFrame)
+        self.agent_log.verticalScrollBar().valueChanged.connect(self._on_agent_log_scroll)
+        agent_l.addWidget(self.agent_log, 1)
+
+        agent_input_row = QFrame()
+        agent_input_row.setObjectName("ai_composer")
+        air = QVBoxLayout(agent_input_row)
+        air.setContentsMargins(12, 8, 12, 10)
+        air.setSpacing(6)
+
+        self.agent_input = QTextEdit()
+        self.agent_input.setPlaceholderText(
+            "Describe what to build or change — e.g. “Add a dark theme toggle with CSS and JS”…"
+        )
+        self.agent_input.setFixedHeight(56)
+        self.agent_input.setAcceptRichText(False)
+        self.agent_input.installEventFilter(self)
+        air.addWidget(self.agent_input)
+
+        agent_btn_row = QHBoxLayout()
+        agent_btn_row.setSpacing(8)
+        self.agent_apply_run_chk = QCheckBox("Auto-run preview after apply")
+        self.agent_apply_run_chk.setChecked(True)
+        self.agent_stop_btn = QPushButton("■  Stop")
+        self.agent_stop_btn.setFixedHeight(30)
+        self.agent_stop_btn.clicked.connect(self._stop_agent)
+        self.agent_send_btn = QPushButton("✦  Ask agent")
+        self.agent_send_btn.setFixedHeight(30)
+        self.agent_send_btn.clicked.connect(self._send_agent_prompt)
+        agent_btn_row.addWidget(self.agent_apply_run_chk)
+        agent_btn_row.addStretch()
+        agent_btn_row.addWidget(self.agent_stop_btn)
+        agent_btn_row.addWidget(self.agent_send_btn)
+        air.addLayout(agent_btn_row)
+        agent_l.addWidget(agent_input_row)
+
+        self._agent_tab_index = self._tabs.addTab(agent_tab, "🤖  Agent")
+        layout.addWidget(self._tabs, 1)
+
+    def set_agent_tab_visible(self, visible):
+        """Show or hide the experimental Agent tab (Settings → Extras)."""
+        if not hasattr(self, "_agent_tab_index"):
+            return
+        self._tabs.setTabVisible(self._agent_tab_index, bool(visible))
+        if not visible:
+            self.stop_agent_if_running()
+            if self._tabs.currentIndex() == self._agent_tab_index:
+                self._tabs.setCurrentIndex(0)
+
+    def apply_theme_styles(self):
+        t = self._theme()
+        self.code_edit.setStyleSheet(
+            f"QTextEdit {{"
+            f"  background: {t['bg']}; color: {t['text']};"
+            f"  border: none; padding: 12px 14px;"
+            f"  font-family: Consolas, 'Courier New', monospace;"
+            f"  font-size: 13px; selection-background-color: {t['accent']}44;"
+            f"}}"
+        )
+        self.code_edit.setFont(QFont("Consolas", 13))
+        self.agent_log.setStyleSheet(
+            f"QTextBrowser {{ background: {t['bg']}; color: {t['text']}; border: none;"
+            f"padding: 10px 12px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px;"
+            f"selection-background-color: {t['accent']}44; }}"
+        )
+        self.agent_input.setStyleSheet(
+            f"QTextEdit {{ background: {t['card']}; color: {t['text']};"
+            f"border: 1px solid {t.get('_ai_surface_border', t['border'])}; border-radius: 10px; padding: 10px 12px;"
+            f"font-size: 13px; selection-background-color: {t['accent']}44; }}"
+        )
+        self.agent_status.setStyleSheet(
+            f"color: {t['subtext']}; background: {t.get('_ai_surface', t['highlight'])};"
+            f"padding: 6px 14px; border-bottom: 1px solid {t.get('_ai_surface_border', t['border'])}; font-size: 12px;"
+        )
+        for btn in (self.agent_send_btn, self.agent_stop_btn):
+            btn.setStyleSheet(
+                f"QPushButton {{ background: {t['accent']}; color: #fff; border: none;"
+                f"border-radius: 8px; padding: 0 14px; font-weight: 600; }}"
+                f"QPushButton:hover {{ background: {t.get('accent2', t['accent'])}; }}"
+                f"QPushButton:disabled {{ background: {t['border']}; color: {t['subtext']}; }}"
+            )
+        self.agent_stop_btn.setStyleSheet(
+            f"QPushButton {{ background: {t.get('red', '#ef4444')}; color: #fff; border: none;"
+            f"border-radius: 8px; padding: 0 14px; font-weight: 600; }}"
+            f"QPushButton:hover {{ background: #dc2626; }}"
+            f"QPushButton:disabled {{ background: {t['border']}; color: {t['subtext']}; }}"
+        )
+        self._tabs.setStyleSheet(
+            f"QTabWidget::pane {{ border: none; background: {t['bg']}; }}"
+            f"QTabBar::tab {{ background: transparent; color: {t['subtext']}; "
+            f"padding: 8px 14px; margin-right: 4px; border-radius: 8px; }}"
+            f"QTabBar::tab:selected {{ background: {t['accent']}; color: #fff; font-weight: 600; }}"
+            f"QTabBar::tab:hover:!selected {{ background: {t.get('_ai_surface', t['highlight'])}; color: {t['text']}; }}"
+        )
+        self._render_agent_log()
+
+    def _get_agent_llm(self):
+        ai = getattr(self.extras_panel, "ai_chat_view", None)
+        return ai._llm if ai and ai._llm else None
+
+    def _agent_model_ready(self):
+        ai = getattr(self.extras_panel, "ai_chat_view", None)
+        if not ai:
+            return False
+        return ai._llm is not None
+
+    def _is_agent_blocked(self):
+        ai = getattr(self.extras_panel, "ai_chat_view", None)
+        if ai and getattr(ai, "_streaming_reply", False):
+            QMessageBox.information(
+                self, "AI busy",
+                "Nova AI Chat is generating a reply. Wait for it to finish, then try again.",
+            )
+            return True
+        if self._agent_busy:
+            return True
+        return False
+
+    def _refresh_agent_controls(self):
+        llm_ready = self._agent_model_ready()
+        busy = self._agent_busy
+        self.agent_send_btn.setEnabled(llm_ready and not busy)
+        self.agent_input.setEnabled(llm_ready and not busy)
+        self.agent_stop_btn.setEnabled(busy)
+        if busy:
+            return
+        if llm_ready:
+            self.agent_status.setText("Agent ready — describe HTML/CSS/JS changes below")
+        elif getattr(self.extras_panel, "ai_chat_view", None) and self.extras_panel.ai_chat_view._models_ready():
+            self.agent_status.setText("Load the model in 🤖 Nova AI Chat (⚙ → Load model), then return here")
+        else:
+            self.agent_status.setText(
+                f"Download & load {_GEMMA_MODEL_LABEL} in 🤖 Nova AI Chat to use the HTML agent"
+            )
+
+    def _tick_agent_think_animation(self):
+        self._agent_think_dots = (self._agent_think_dots + 1) % 4
+        dots = "." * self._agent_think_dots
+        self.agent_status.setText(f"Thinking — analyzing your prompt{dots}")
+
+    def _start_agent_think_animation(self):
+        self._agent_think_dots = 0
+        self._agent_think_timer.start(450)
+
+    def _stop_agent_think_animation(self):
+        self._agent_think_timer.stop()
+
+    def _on_agent_log_scroll(self, value):
+        if self._agent_scroll_guard:
+            return
+        sb = self.agent_log.verticalScrollBar()
+        self._agent_scroll_pinned = value >= max(0, sb.maximum() - 48)
+
+    def _apply_agent_log_scroll(self, pinned, old_pos):
+        sb = self.agent_log.verticalScrollBar()
+        self._agent_scroll_guard = True
+        if pinned:
+            sb.setValue(sb.maximum())
+        else:
+            sb.setValue(min(old_pos, sb.maximum()))
+        self._agent_scroll_guard = False
+
+    def _render_agent_log(self):
+        t = self._theme()
+        pal = _ai_ui_palette(t)
+        bubble_bg = t.get("_ai_bubble_ai_bg", pal["bubble_ai_bg"])
+        bubble_border = t.get("_ai_bubble_ai_border", pal["surface_border"])
+        if not self._agent_blocks and not self._agent_stream_buf:
+            self.agent_log.setHtml(
+                f"<div style='color:{t['subtext']};padding:24px 8px;line-height:1.6;'>"
+                f"<div style='font-size:15px;font-weight:600;color:{t['text']};margin-bottom:8px;'>"
+                f"HTML AI Agent</div>"
+                f"Describe a change in plain language — the agent <b>plans</b> the edit, then "
+                f"applies <b>small patches</b> to your code instead of rewriting the whole file."
+                f"</div>"
+            )
+            return
+        parts = [
+            f"<div style='font-family:\"Segoe UI\",Arial,sans-serif;padding:4px 2px 16px;"
+            f"background:transparent;'>"
+        ]
+        for block in self._agent_blocks:
+            role = block.get("role", "system")
+            text = html.escape(block.get("text", "")).replace("\n", "<br>")
+            if role == "user":
+                parts.append(
+                    f'<div style="display:flex;justify-content:flex-end;margin:10px 0 6px;">'
+                    f'<div style="max-width:78%;background:linear-gradient(135deg,{t["accent"]},{t["accent2"]});'
+                    f'color:#fff;padding:11px 15px;border-radius:18px 18px 4px 18px;'
+                    f'font-size:13.5px;line-height:1.55;box-shadow:0 2px 12px {t["accent"]}33;">'
+                    f"{text}</div></div>"
+                )
+            elif role == "thinking":
+                parts.append(
+                    f'<div style="display:flex;align-items:flex-start;gap:10px;margin:10px 0 6px;">'
+                    f'<div style="flex-shrink:0;width:28px;height:28px;border-radius:50%;'
+                    f'background:{pal["surface"]};border:1px solid {pal["surface_border"]};'
+                    f'display:flex;align-items:center;justify-content:center;font-size:14px;">💭</div>'
+                    f'<div style="max-width:78%;background:{bubble_bg};'
+                    f'border:1px solid {bubble_border};border-radius:4px 16px 16px 16px;'
+                    f'padding:12px 14px;box-shadow:0 2px 10px rgba(0,0,0,0.15);">'
+                    f'<div style="font-size:10px;font-weight:700;color:{t["accent"]};'
+                    f'letter-spacing:0.6px;margin-bottom:6px;">THINKING</div>'
+                    f'<div style="color:{t["text"]};font-size:12.5px;line-height:1.55;">{text}</div>'
+                    f"</div></div>"
+                )
+            elif role == "assistant":
+                parts.append(
+                    f'<div style="display:flex;align-items:flex-start;gap:10px;margin:10px 0 6px;">'
+                    f'<div style="flex-shrink:0;width:28px;height:28px;border-radius:50%;'
+                    f'background:linear-gradient(135deg,{t["accent"]},{t["accent2"]});'
+                    f'color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;'
+                    f'justify-content:center;">✦</div>'
+                    f'<div style="max-width:78%;background:{bubble_bg};'
+                    f'border:1px solid {bubble_border};border-radius:4px 16px 16px 16px;'
+                    f'padding:12px 14px;color:{t["text"]};line-height:1.55;'
+                    f'box-shadow:0 2px 10px rgba(0,0,0,0.15);">{text}</div></div>'
+                )
+            else:
+                parts.append(
+                    f'<div style="margin:8px 0;text-align:center;">'
+                    f'<span style="display:inline-block;color:{t["subtext"]};font-size:11.5px;'
+                    f'padding:5px 14px;border-radius:14px;background:{pal["surface"]};'
+                    f'border:1px solid {pal["surface_border"]};">{text}</span></div>'
+                )
+        if self._agent_stream_buf and self._agent_busy:
+            preview = html.escape(self._agent_stream_buf[-800:]).replace("\n", "<br>")
+            parts.append(
+                f'<div style="display:flex;align-items:flex-start;gap:10px;margin:10px 0 6px;">'
+                f'<div style="flex-shrink:0;width:28px;height:28px;border-radius:50%;'
+                f'background:linear-gradient(135deg,{t["accent"]},{t["accent2"]});'
+                f'color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;'
+                f'justify-content:center;">✦</div>'
+                f'<div style="max-width:78%;background:{bubble_bg};'
+                f'border:1px solid {bubble_border};border-radius:4px 16px 16px 16px;'
+                f'padding:10px 12px;font-family:Consolas,monospace;font-size:11px;'
+                f'color:{t["subtext"]};white-space:pre-wrap;line-height:1.45;">'
+                f'{preview}<span style="color:{t["accent"]};">▍</span></div></div>'
+            )
+        parts.append("</div>")
+        sb = self.agent_log.verticalScrollBar()
+        pinned = self._agent_scroll_pinned
+        old_pos = sb.value()
+        self.agent_log.setHtml("".join(parts))
+        QTimer.singleShot(
+            0,
+            lambda p=pinned, o=old_pos: self._apply_agent_log_scroll(p, o),
+        )
+
+    def _send_agent_prompt(self):
+        if self._is_agent_blocked():
+            return
+        llm = self._get_agent_llm()
+        if not llm:
+            QMessageBox.information(
+                self,
+                "Model not loaded",
+                f"Open 🤖 Nova AI Chat, download {_GEMMA_MODEL_LABEL} if needed, "
+                f"then click Load model in ⚙ settings.",
+            )
+            return
+        text = self.agent_input.toPlainText().strip()
+        if not text:
+            return
+        self.agent_input.clear()
+        self._agent_blocks.append({"role": "user", "text": text})
+        self._agent_stream_buf = ""
+        self._agent_scroll_pinned = True
+        self._agent_busy = True
+        self._tabs.setCurrentIndex(2)
+        self._start_agent_think_animation()
+        self._render_agent_log()
+        self._refresh_agent_controls()
+
+        ai = self.extras_panel.ai_chat_view
+        s = ai._current_settings()
+        self._agent_worker = _HtmlAgentWorker(
+            llm,
+            text,
+            self.code_edit.toPlainText(),
+            self._agent_history,
+            s["temperature"],
+            s["top_p"],
+            s["top_k"],
+            min(8192, max(2048, s.get("max_tokens", 2048))),
+        )
+        self._agent_worker.thinking_done.connect(self._on_agent_thinking_done)
+        self._agent_worker.token.connect(self._on_agent_token)
+        self._agent_worker.code_ready.connect(self._on_agent_code_ready)
+        self._agent_worker.failed.connect(self._on_agent_failed)
+        self._agent_worker.status.connect(self._on_agent_status)
+        self._agent_worker.finished.connect(self._on_agent_worker_finished)
+        self._agent_worker.start()
+        self.extras_panel.parent_player.status_label.setText("HTML Viewer  ·  Agent thinking…")
+
+    def _stop_agent(self):
+        if self._agent_worker and self._agent_worker.isRunning():
+            self._agent_worker.stop()
+        self._stop_agent_think_animation()
+        self._agent_stream_buf = ""
+        self._agent_blocks.append({"role": "system", "text": "Agent stopped."})
+        self._render_agent_log()
+        self.agent_status.setText("Stopping agent…")
+        self.agent_stop_btn.setEnabled(False)
+
+    def stop_agent_if_running(self):
+        if self._agent_busy:
+            self._stop_agent()
+        if self._agent_worker and self._agent_worker.isRunning():
+            self._agent_worker.stop()
+            self._agent_worker.wait(2000)
+
+    def _on_agent_status(self, msg):
+        if "Thinking" in msg:
+            self._start_agent_think_animation()
+        else:
+            self._stop_agent_think_animation()
+            self.agent_status.setText(msg)
+
+    def _on_agent_thinking_done(self, mode, plan, clarified):
+        self._stop_agent_think_animation()
+        mode_label = "CREATE new page" if mode == "create" else "EDIT existing code"
+        body = f"Mode: {mode_label}\n\n"
+        if plan:
+            body += f"Plan:\n{plan.strip()}\n\n"
+        body += f"Task:\n{clarified.strip()}"
+        self._agent_blocks.append({"role": "thinking", "text": body})
+        if mode == "create":
+            self.agent_status.setText("Building new HTML page…")
+        else:
+            self.agent_status.setText("Applying targeted patches…")
+        self._render_agent_log()
+
+    def _on_agent_token(self, token):
+        self._agent_stream_buf += token
+        self._render_agent_log()
+
+    def _on_agent_code_ready(self, html_code, summary, method):
+        self._current_path = None
+        self.code_edit.setPlainText(html_code)
+        self.path_lbl.setText("Updated by AI agent")
+        if method == "patch":
+            msg = summary or "Applied targeted patches to your project."
+        elif method == "create":
+            msg = summary or "Created a new HTML page."
+        else:
+            msg = summary or "Updated the Code tab."
+        self._agent_blocks.append({"role": "assistant", "text": msg})
+        last_user = ""
+        for b in reversed(self._agent_blocks):
+            if b.get("role") == "user":
+                last_user = b.get("text", "")
+                break
+        if last_user:
+            self._agent_history.append({"role": "user", "content": last_user})
+            self._agent_history.append({"role": "assistant", "content": msg})
+            self._agent_history = self._agent_history[-10:]
+        self._agent_stream_buf = ""
+        self._render_agent_log()
+        if self.agent_apply_run_chk.isChecked():
+            self._run_html()
+        else:
+            self._tabs.setCurrentIndex(0)
+        self.extras_panel.parent_player.status_label.setText("HTML Viewer  ·  Agent applied code")
+
+    def _on_agent_failed(self, err):
+        self._stop_agent_think_animation()
+        self._agent_stream_buf = ""
+        self._agent_blocks.append({"role": "system", "text": f"Agent error: {err}"})
+        self._render_agent_log()
+        self._refresh_agent_controls()
+        self.extras_panel.parent_player.status_label.setText("HTML Viewer  ·  Agent failed")
+
+    def _on_agent_worker_finished(self):
+        self._stop_agent_think_animation()
+        self._agent_busy = False
+        self._agent_worker = None
+        self._refresh_agent_controls()
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.KeyPress:
+            if (
+                event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            ):
+                if obj is self.code_edit:
+                    self._run_html()
+                    return True
+                if obj is self.agent_input and not self._is_agent_blocked():
+                    self._send_agent_prompt()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _open_file(self):
+        start_dir = os.path.dirname(self._current_path) if self._current_path else os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open HTML File", start_dir, "HTML Files (*.html *.htm);;All Files (*.*)"
+        )
+        if not path:
+            return
+        self.load_file(path)
+
+    def load_file(self, path):
+        if not self.web:
+            return
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                self.code_edit.setPlainText(f.read())
+        except OSError as e:
+            QMessageBox.warning(self, "Open failed", f"Could not read file:\n{e}")
+            return
+        self._current_path = path
+        self.path_lbl.setText(path)
+        self.web.setUrl(QUrl.fromLocalFile(path))
+        self._tabs.setCurrentWidget(self._preview_tab)
+        self.extras_panel.parent_player.status_label.setText(
+            f"HTML Viewer  ·  {os.path.basename(path)}"
+        )
+
+    def _run_html(self):
+        if not self.web:
+            return
+        html = self.code_edit.toPlainText().strip()
+        if not html:
+            self.path_lbl.setText("Code tab is empty — paste HTML first")
+            self._tabs.setCurrentIndex(0)
+            return
+        base = QUrl.fromLocalFile(self._current_path) if self._current_path else QUrl("about:blank")
+        self.web.setHtml(html, base)
+        if not self._current_path:
+            self.path_lbl.setText("Running pasted HTML")
+            self.extras_panel.parent_player.status_label.setText("HTML Viewer  ·  Running pasted HTML")
+        self._tabs.setCurrentWidget(self._preview_tab)
+        self.web.setFocus()
+
+    def _reload(self):
+        if not self.web:
+            return
+        if self._current_path and os.path.isfile(self._current_path):
+            self.web.reload()
+            self._tabs.setCurrentWidget(self._preview_tab)
+        else:
+            self._run_html()
+
+    def _handle_fullscreen_request(self, request):
+        if not _WEBENGINE_AVAILABLE:
+            return
+        request.accept()
+        if request.toggleOn():
+            if self._fs_window is None:
+                self._enter_fullscreen()
+        else:
+            self._exit_fullscreen()
+
+    def _toggle_fullscreen(self):
+        if self._fs_window is None:
+            if self._tabs.currentWidget() is not self._preview_tab:
+                self._run_html()
+            self._enter_fullscreen()
+        else:
+            self._exit_fullscreen()
+
+    def _enter_fullscreen(self):
+        if self._fs_window is not None or not self.web:
+            return
+        parent_lay = self._web_host.parentWidget().layout()
+        if parent_lay:
+            parent_lay.removeWidget(self._web_host)
+        self._fs_container.layout().addWidget(self._web_host, 1)
+        self._web_host.show()
+        self._fs_window = self._fs_container
+        if self._fs_esc_shortcut:
+            self._fs_esc_shortcut.setEnabled(True)
+        self._fs_container.showFullScreen()
+        self.web.setFocus()
+
+    def _exit_fullscreen(self):
+        if self._fs_window is None:
+            return
+        if self.web:
+            try:
+                self.web.triggerPageAction(QWebEnginePage.WebAction.ExitFullScreen)
+            except Exception:
+                pass
+        fs_lay = self._fs_container.layout()
+        fs_lay.removeWidget(self._web_host)
+        self._preview_layout.addWidget(self._web_host, 1)
+        self._web_host.show()
+        if self._fs_esc_shortcut:
+            self._fs_esc_shortcut.setEnabled(False)
+        self._fs_container.hide()
+        self._fs_window = None
+        if self.web:
+            self.web.setFocus()
+
+    def exit_fullscreen_if_open(self):
+        if self._fs_window is not None:
+            self._exit_fullscreen()
+
+
+# ──────────────────────────── OFFLINE AI CHAT (GEMMA 4 E2B) ────────────────────────────
+
+class _GemmaModelDownloadThread(QThread):
+    progress = pyqtSignal(int, str)
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, url, dest_path, label):
+        super().__init__()
+        self.url = url
+        self.dest_path = dest_path
+        self.label = label
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        tmp_path = self.dest_path + ".part"
+        try:
+            os.makedirs(os.path.dirname(self.dest_path), exist_ok=True)
+            req = urllib.request.Request(self.url, headers={"User-Agent": "NovaX7/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                chunk_size = 1024 * 256
+                with open(tmp_path, "wb") as out:
+                    while True:
+                        if self._stop:
+                            raise InterruptedError("Download cancelled")
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        done += len(chunk)
+                        if total > 0:
+                            pct = min(100, int(done * 100 / total))
+                            mb_done = done / (1024 * 1024)
+                            mb_total = total / (1024 * 1024)
+                            self.progress.emit(
+                                pct,
+                                f"Downloading {self.label}… {mb_done:.0f} / {mb_total:.0f} MB ({pct}%)",
+                            )
+                        else:
+                            mb_done = done / (1024 * 1024)
+                            self.progress.emit(0, f"Downloading {self.label}… {mb_done:.0f} MB")
+            os.replace(tmp_path, self.dest_path)
+            self.finished_ok.emit(self.dest_path)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            if not self._stop:
+                self.failed.emit(str(e))
+
+
+class _LlamaGpuInstallThread(QThread):
+    progress = pyqtSignal(int, str)
+    finished_ok = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            self.progress.emit(10, "Installing CUDA llama-cpp-python for your RTX GPU…")
+            _pip_install_llama_cpp(use_gpu=True)
+            if not _llama_gpu_offload_available():
+                raise RuntimeError(
+                    "CUDA package installed but GPU offload still unavailable. Restart Nova and try again."
+                )
+            self.progress.emit(100, "GPU support installed.")
+            self.finished_ok.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class _NovaAiSetupThread(QThread):
+    """Install llama-cpp-python if needed, then download model + mmproj."""
+    progress = pyqtSignal(int, str)
+    finished_ok = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, install_llama, use_gpu):
+        super().__init__()
+        self.install_llama = install_llama
+        self.use_gpu = use_gpu
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    @staticmethod
+    def _download_file(url, dest_path, label, progress_cb, stop_check):
+        tmp_path = dest_path + ".part"
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            chunk_size = 1024 * 256
+            with open(tmp_path, "wb") as out:
+                while True:
+                    if stop_check():
+                        raise InterruptedError("Setup cancelled")
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total > 0:
+                        pct = min(100, int(done * 100 / total))
+                        mb_done = done / (1024 * 1024)
+                        mb_total = total / (1024 * 1024)
+                        progress_cb(
+                            pct,
+                            f"Downloading {label}… {mb_done:.0f} / {mb_total:.0f} MB ({pct}%)",
+                        )
+                    else:
+                        mb_done = done / (1024 * 1024)
+                        progress_cb(0, f"Downloading {label}… {mb_done:.0f} MB")
+        os.replace(tmp_path, dest_path)
+
+    def run(self):
+        try:
+            if self.install_llama:
+                self.progress.emit(0, "Installing llama-cpp-python…")
+                _pip_install_llama_cpp(use_gpu=self.use_gpu)
+
+            downloads = []
+            if not os.path.isfile(_GEMMA_MODEL_PATH):
+                downloads.append(
+                    (_GEMMA_MODEL_URL, _GEMMA_MODEL_PATH, f"{_GEMMA_MODEL_LABEL} model")
+                )
+            if not os.path.isfile(_GEMMA_MMPROJ_PATH):
+                downloads.append(
+                    (_GEMMA_MMPROJ_URL, _GEMMA_MMPROJ_PATH, "vision/audio projector")
+                )
+
+            for i, (url, path, label) in enumerate(downloads):
+                if self._stop:
+                    raise InterruptedError("Setup cancelled")
+
+                def _progress(pct, msg, base=i, total=len(downloads)):
+                    overall = int((base * 100 + pct) / max(1, total))
+                    self.progress.emit(overall, msg)
+
+                try:
+                    self._download_file(
+                        url, path, label, _progress, lambda: self._stop
+                    )
+                except Exception as e:
+                    try:
+                        tmp = path + ".part"
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+                    raise
+
+            self.progress.emit(100, "Setup complete.")
+            self.finished_ok.emit()
+        except Exception as e:
+            if not self._stop:
+                self.failed.emit(str(e))
+
+
+class _GemmaChatWorker(QThread):
+    token = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, llm, messages, temperature, top_p, top_k, max_tokens=2048):
+        super().__init__()
+        self.llm = llm
+        self.messages = messages
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.max_tokens = max_tokens
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+        self.requestInterruption()
+
+    def _extract_chunk_text(self, choice):
+        delta = choice.get("delta") or {}
+        text = delta.get("content") or ""
+        if not text:
+            msg = choice.get("message") or {}
+            text = msg.get("content") or ""
+        if not text:
+            text = choice.get("text") or ""
+        return text
+
+    def run(self):
+        finish_reason = ""
+        try:
+            stream = self.llm.create_chat_completion(
+                messages=self.messages,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                repeat_penalty=1.1,
+                stream=True,
+            )
+            for chunk in stream:
+                if self._stop or self.isInterruptionRequested():
+                    finish_reason = "stopped"
+                    break
+                choice = chunk.get("choices", [{}])[0]
+                reason = choice.get("finish_reason")
+                if reason:
+                    finish_reason = reason
+                text = self._extract_chunk_text(choice)
+                if text:
+                    self.token.emit(text)
+            self.finished.emit(finish_reason or "")
+        except Exception as e:
+            if self._stop or self.isInterruptionRequested():
+                self.finished.emit("stopped")
+            else:
+                self.failed.emit(str(e))
+
+
+class NovaAiChatPanel(QWidget):
+    """Offline chat using Gemma 4 E2B (GGUF) via llama-cpp-python."""
+
+    _SUGGESTIONS = (
+        "Summarize a song's mood in one paragraph",
+        "Suggest a playlist name for late-night drives",
+        "Explain how crossfade works in NovaX7",
+        "Write a short poem about music",
+    )
+
+    def __init__(self, extras_panel):
+        super().__init__(extras_panel)
+        self.extras_panel = extras_panel
+        self._setup_thread = None
+        self._gpu_install_thread = None
+        self._chat_worker = None
+        self._llm = None
+        self._loaded_on_gpu = False
+        self._messages = []
+        self._display_blocks = []
+        self._assistant_buffer = ""
+        self._streaming_reply = False
+        self._stop_requested = False
+        self._chat_pinned_bottom = True
+        self._chat_scroll_guard = False
+        self._pending_images = []
+        self._pending_audio = []
+        self._settings = _load_ai_chat_settings()
+        self._build_ui()
+        self.apply_theme_styles()
+        self.refresh_status()
+
+    def _theme(self):
+        p = self.extras_panel.parent_player
+        base = p.theme if hasattr(p, "theme") else THEMES["Midnight"]
+        return _theme_for_ai_ui(base)
+
+    def _glass(self):
+        t = self._theme()
+        pal = _ai_ui_palette(t)
+        if t.get("_liquid_glass"):
+            return {
+                "panel": "rgba(255,255,255,12)",
+                "card": "rgba(255,255,255,18)",
+                "header": "rgba(255,255,255,12)",
+                "composer": "rgba(255,255,255,12)",
+                "input": "rgba(255,255,255,18)",
+                "border": "rgba(91,141,238,0.22)",
+                "rim": f"{pal['accent']}88",
+                "bubble_ai": pal["bubble_ai_bg"],
+                "chip": pal["surface"],
+            }
+        return {
+            "panel": t["panel"],
+            "card": t["card"],
+            "header": t["bg"],
+            "composer": t["bg"],
+            "input": t["card"],
+            "border": pal["surface_border"],
+            "rim": pal["accent"] + "66",
+            "bubble_ai": pal["bubble_ai_bg"],
+            "chip": pal["surface"],
+        }
+
+    def apply_theme_styles(self):
+        t = self._theme()
+        g = self._glass()
+
+        self.setStyleSheet(f"background: {g['panel']}; color: {t['text']};")
+
+        # body stack is transparent so panel bg shows through
+        if hasattr(self, "_body_stack"):
+            self._body_stack.setStyleSheet("background: transparent;")
+
+        self.header.setStyleSheet(
+            f"QFrame#ai_chat_header {{"
+            f"  background: {g['header']};"
+            f"  border-bottom: 1px solid {g['border']};"
+            f"}}"
+        )
+        self.settings_panel.setStyleSheet(
+            f"QFrame#ai_settings_panel {{"
+            f"  background: {g['card']};"
+            f"  border-bottom: 1px solid {g['border']};"
+            f"}}"
+        )
+        self.composer.setStyleSheet(
+            f"QFrame#ai_composer {{"
+            f"  background: {g['composer']};"
+            f"  border-top: 1px solid {g['border']};"
+            f"}}"
+        )
+        self.composer_inner.setStyleSheet(
+            f"QFrame#ai_composer_inner {{"
+            f"  background: {g['input']};"
+            f"  border: 1px solid {g['border']};"
+            f"  border-radius: 20px;"
+            f"}}"
+        )
+
+        # chat log + scrollbar
+        self.chat_log.setStyleSheet(
+            f"QTextBrowser {{"
+            f"  background: {t['bg']}; color: {t['text']}; border: none;"
+            f"  padding: 8px 12px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px;"
+            f"  selection-background-color: {t['accent']}44;"
+            f"}}"
+            f"QScrollBar:vertical {{"
+            f"  background: transparent; width: 4px; border-radius: 2px; margin: 4px 2px;"
+            f"}}"
+            f"QScrollBar::handle:vertical {{"
+            f"  background: {g['border']}; border-radius: 2px; min-height: 28px;"
+            f"}}"
+            f"QScrollBar::handle:vertical:hover {{"
+            f"  background: {t['subtext']};"
+            f"}}"
+            f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}"
+        )
+
+        self.input_edit.setStyleSheet(
+            f"QTextEdit {{"
+            f"  background: transparent; color: {t['text']}; border: none;"
+            f"  padding: 10px 4px 10px 2px; font-size: 14px; font-family: 'Segoe UI', Arial, sans-serif;"
+            f"  selection-background-color: {t['accent']}44;"
+            f"}}"
+        )
+
+        self.hint_lbl.setStyleSheet(
+            f"color: {t['subtext']}; font-size: 10.5px; background: transparent; letter-spacing: 0.2px;"
+        )
+        self.status_pill.setStyleSheet(
+            f"color: {t['subtext']}; font-size: 11px; padding: 4px 12px;"
+            f"background: {t.get('_ai_surface', t['highlight'])}; border-radius: 14px;"
+            f"border: 1px solid {t.get('_ai_surface_border', g['border'])};"
+        )
+        self.attachments_lbl.setStyleSheet(
+            f"color: {t['subtext']}; font-size: 11px; padding: 2px 6px;"
+            f"background: {g['chip']}; border-radius: 8px; border: 1px solid {g['border']};"
+        )
+        self.progress.setStyleSheet(
+            f"QProgressBar {{"
+            f"  background: {g['input']}; border: 1px solid {g['border']};"
+            f"  border-radius: 5px; max-height: 6px;"
+            f"}}"
+            f"QProgressBar::chunk {{"
+            f"  background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            f"  stop:0 {t['accent']},stop:1 {t['accent2']});"
+            f"  border-radius: 5px;"
+            f"}}"
+        )
+
+        ghost_ss = (
+            f"QPushButton {{"
+            f"  background: transparent; color: {t['subtext']};"
+            f"  border: 1px solid {g['border']}; border-radius: 10px;"
+            f"  padding: 5px 13px; font-size: 12px; font-weight: 500;"
+            f"}}"
+            f"QPushButton:hover {{"
+            f"  background: {t.get('_ai_surface', t['highlight'])}; color: {t['text']}; border-color: {g['rim']};"
+            f"}}"
+            f"QPushButton:disabled {{ color: {t['border']}; border-color: {g['border']}; }}"
+        )
+        icon_ss = (
+            f"QPushButton {{"
+            f"  background: transparent; color: {t['subtext']}; border: none;"
+            f"  border-radius: 17px; min-width: 34px; max-width: 34px;"
+            f"  min-height: 34px; max-height: 34px; font-size: 16px;"
+            f"}}"
+            f"QPushButton:hover {{ background: {t.get('_ai_surface', t['highlight'])}; color: {t['text']}; }}"
+            f"QPushButton:disabled {{ color: {t['border']}; }}"
+        )
+        for btn in (
+            self.settings_btn, self.new_chat_btn,
+            self.attach_img_btn, self.attach_aud_btn, self.clear_attach_btn,
+        ):
+            btn.setStyleSheet(icon_ss)
+        for btn in (
+            self.download_btn, self.load_btn, self.unload_btn,
+            self.clear_btn, self.gpu_install_btn,
+        ):
+            btn.setStyleSheet(ghost_ss)
+
+        self._style_send_btn(streaming=self._streaming_reply)
+
+        spin_ss = (
+            f"QDoubleSpinBox, QSpinBox, QComboBox {{"
+            f"  background: {g['input']}; color: {t['text']};"
+            f"  border: 1px solid {g['border']}; border-radius: 8px;"
+            f"  padding: 4px 8px; min-height: 28px;"
+            f"}}"
+            f"QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {{"
+            f"  border-color: {g['rim']};"
+            f"}}"
+        )
+        for w in (self.temp_spin, self.top_p_spin, self.top_k_spin, self.max_tokens_spin, self.device_combo):
+            w.setStyleSheet(spin_ss)
+
+        self._avatar_lbl.setStyleSheet(
+            f"background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            f"stop:0 {t['accent']},stop:1 {t['accent2']});"
+            f"color: #ffffff; border-radius: 14px; font-size: 13px; font-weight: 700;"
+        )
+        self._title_lbl.setStyleSheet(
+            f"color: {t['text']}; background: transparent;"
+        )
+        self._sub_lbl.setStyleSheet(
+            f"color: {t['subtext']}; font-size: 11px; letter-spacing: 0.2px;"
+        )
+        self.device_hint_lbl.setStyleSheet(
+            f"color: {t['subtext']}; font-size: 11px; line-height: 1.5;"
+        )
+
+        self._update_welcome_styles()
+
+        if self._display_blocks or self._streaming_reply:
+            self._render_chat_log()
+        else:
+            self._render_empty_state()
+
+    def _update_welcome_styles(self):
+        """Apply theme colours to the static welcome-page widgets."""
+        if not hasattr(self, "_welcome_headline"):
+            return
+        t = self._theme()
+        g = self._glass()
+        pal = _ai_ui_palette(t)
+
+        self._welcome_page.setStyleSheet("background: transparent;")
+        self._welcome_icon_lbl.setStyleSheet(
+            f"color: {t['accent']}; background: transparent;"
+        )
+        self._welcome_headline.setStyleSheet(
+            f"color: {t['text']}; background: transparent;"
+        )
+        self._welcome_sub_lbl.setStyleSheet(
+            f"color: {t['subtext']}; background: transparent;"
+        )
+        self._chips_frame.setStyleSheet("background: transparent;")
+
+        chip_ss = (
+            f"QPushButton {{"
+            f"  background: {pal['surface']}; color: {t['text']};"
+            f"  border: 1px solid {pal['surface_border']}; border-radius: 20px;"
+            f"  padding: 0px 16px; font-size: 12.5px; text-align: center;"
+            f"}}"
+            f"QPushButton:hover {{"
+            f"  background: {pal['highlight']}; border-color: {pal['accent']};"
+            f"  color: {t['text']};"
+            f"}}"
+        )
+        for btn in getattr(self, "_chip_btns", []):
+            btn.setStyleSheet(chip_ss)
+
+    def _style_send_btn(self, streaming=False):
+        t = self._theme()
+        g = self._glass()
+        if streaming:
+            self.send_btn.setText("■")
+            self.send_btn.setToolTip("Stop generating")
+            self.send_btn.setStyleSheet(
+                f"QPushButton {{ background: {t['red']}; color: #ffffff; border: none; "
+                f"border-radius: 19px; min-width: 38px; max-width: 38px; min-height: 38px; max-height: 38px; "
+                f"font-size: 14px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: {t['red']}cc; }}"
+            )
+        else:
+            self.send_btn.setText("↑")
+            self.send_btn.setToolTip("Send (Enter)")
+            self.send_btn.setStyleSheet(
+                f"QPushButton {{ background: {t['accent']}; color: #ffffff; border: none; "
+                f"border-radius: 19px; min-width: 38px; max-width: 38px; min-height: 38px; max-height: 38px; "
+                f"font-size: 17px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: {t['accent2']}; }}"
+                f"QPushButton:disabled {{ background: {g['border']}; color: {t['subtext']}; }}"
+            )
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── Minimal header (ChatGPT-style) ────────────────────────────────────
+        self.header = QFrame()
+        self.header.setObjectName("ai_chat_header")
+        self.header.setFixedHeight(50)
+        hb = QHBoxLayout(self.header)
+        hb.setContentsMargins(16, 0, 12, 0)
+        hb.setSpacing(8)
+
+        self._avatar_lbl = QLabel("✦")
+        self._avatar_lbl.setFixedSize(28, 28)
+        self._avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._title_lbl = QLabel("Nova AI")
+        self._title_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+
+        # keep _sub_lbl as hidden placeholder (referenced in apply_theme_styles)
+        self._sub_lbl = QLabel(f"{_GEMMA_MODEL_LABEL}  ·  Offline")
+        self._sub_lbl.hide()
+
+        self.status_pill = QLabel("● Setup required")
+        self.status_pill.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self.new_chat_btn = QPushButton("✎")
+        self.new_chat_btn.setFixedSize(30, 30)
+        self.new_chat_btn.setToolTip("New chat")
+        self.new_chat_btn.clicked.connect(self._clear_chat)
+
+        self.settings_btn = QPushButton("⚙")
+        self.settings_btn.setFixedSize(32, 32)
+        self.settings_btn.setToolTip("Settings & model downloads")
+        self.settings_btn.setCheckable(True)
+        self.settings_btn.toggled.connect(self._toggle_settings_panel)
+
+        hb.addWidget(self._avatar_lbl)
+        hb.addWidget(self._title_lbl)
+        hb.addStretch()
+        hb.addWidget(self.status_pill)
+        hb.addSpacing(6)
+        hb.addWidget(self.new_chat_btn)
+        hb.addWidget(self.settings_btn)
+        layout.addWidget(self.header)
+
+        # ── Settings panel (collapsible slide-down) ────────────────────────────
+        self.settings_panel = QFrame()
+        self.settings_panel.setObjectName("ai_settings_panel")
+        self.settings_panel.setVisible(False)
+        sp = QVBoxLayout(self.settings_panel)
+        sp.setContentsMargins(16, 12, 16, 12)
+        sp.setSpacing(10)
+
+        sf = QFormLayout()
+        sf.setSpacing(8)
+        self.temp_spin = QDoubleSpinBox()
+        self.temp_spin.setRange(0.0, 2.0)
+        self.temp_spin.setSingleStep(0.05)
+        self.temp_spin.setDecimals(2)
+        self.temp_spin.setValue(self._settings["temperature"])
+        self.temp_spin.valueChanged.connect(self._on_settings_changed)
+
+        self.top_p_spin = QDoubleSpinBox()
+        self.top_p_spin.setRange(0.0, 1.0)
+        self.top_p_spin.setSingleStep(0.05)
+        self.top_p_spin.setDecimals(2)
+        self.top_p_spin.setValue(self._settings["top_p"])
+        self.top_p_spin.valueChanged.connect(self._on_settings_changed)
+
+        self.top_k_spin = QSpinBox()
+        self.top_k_spin.setRange(0, 200)
+        self.top_k_spin.setValue(self._settings["top_k"])
+        self.top_k_spin.valueChanged.connect(self._on_settings_changed)
+
+        self.max_tokens_spin = QSpinBox()
+        self.max_tokens_spin.setRange(64, 8192)
+        self.max_tokens_spin.setSingleStep(128)
+        self.max_tokens_spin.setValue(self._settings.get("max_tokens", 2048))
+        self.max_tokens_spin.valueChanged.connect(self._on_settings_changed)
+
+        self.device_combo = QComboBox()
+        self.device_combo.addItem("CPU (recommended)", "cpu")
+        self.device_combo.addItem("GPU (CUDA)", "gpu")
+        idx = self.device_combo.findData(self._settings["device"])
+        self.device_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
+
+        self.device_hint_lbl = QLabel("")
+        self.device_hint_lbl.setWordWrap(True)
+
+        sf.addRow("Temperature", self.temp_spin)
+        sf.addRow("Top P", self.top_p_spin)
+        sf.addRow("Top K", self.top_k_spin)
+        sf.addRow("Max tokens", self.max_tokens_spin)
+        sf.addRow("Inference", self.device_combo)
+        sf.addRow("", self.device_hint_lbl)
+        sp.addLayout(sf)
+
+        model_row = QHBoxLayout()
+        self.load_btn = QPushButton("Load model")
+        self.load_btn.setFixedHeight(30)
+        self.load_btn.clicked.connect(self._load_model)
+        self.unload_btn = QPushButton("Unload")
+        self.unload_btn.setFixedHeight(30)
+        self.unload_btn.clicked.connect(self._unload_model)
+        self.download_btn = QPushButton(f"⬇  Download {_GEMMA_MODEL_LABEL}")
+        self.download_btn.clicked.connect(self._start_download)
+        self.clear_btn = QPushButton("Clear chat")
+        self.clear_btn.clicked.connect(self._clear_chat)
+        model_row.addWidget(self.load_btn)
+        model_row.addWidget(self.unload_btn)
+        model_row.addWidget(self.download_btn)
+        model_row.addWidget(self.clear_btn)
+        model_row.addStretch()
+        sp.addLayout(model_row)
+
+        gpu_row = QHBoxLayout()
+        self.gpu_install_btn = QPushButton("⚡  Enable GPU (CUDA)")
+        self.gpu_install_btn.setToolTip(
+            "Install CUDA llama-cpp for RTX 3060 Ti (Ampere). "
+            "Requires NVIDIA CUDA Toolkit 12.x installed first."
+        )
+        self.gpu_install_btn.clicked.connect(self._install_gpu_support)
+        gpu_row.addWidget(self.gpu_install_btn)
+        gpu_row.addStretch()
+        sp.addLayout(gpu_row)
+        self._refresh_device_controls()
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setVisible(False)
+        self.progress.setFixedHeight(6)
+        sp.addWidget(self.progress)
+        layout.addWidget(self.settings_panel)
+
+        # ── Body: stacked widget (welcome page | chat log) ─────────────────────
+        self._body_stack = QStackedWidget()
+
+        # Page 0 — ChatGPT-style welcome screen
+        self._welcome_page = self._build_welcome_page()
+        self._body_stack.addWidget(self._welcome_page)   # index 0
+
+        # Page 1 — Scrollable chat log
+        self.chat_log = QTextBrowser()
+        self.chat_log.setReadOnly(True)
+        self.chat_log.setOpenLinks(False)
+        self.chat_log.setOpenExternalLinks(False)
+        self.chat_log.setFrameShape(QFrame.Shape.NoFrame)
+        self.chat_log.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.chat_log.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chat_log.anchorClicked.connect(self._on_chat_link)
+        self.chat_log.verticalScrollBar().valueChanged.connect(self._on_chat_scroll)
+        self._body_stack.addWidget(self.chat_log)         # index 1
+
+        layout.addWidget(self._body_stack, 1)
+
+        # ── Composer — ChatGPT-style vertical pill ─────────────────────────────
+        self.composer = QFrame()
+        self.composer.setObjectName("ai_composer")
+        comp_l = QVBoxLayout(self.composer)
+        comp_l.setContentsMargins(16, 6, 16, 12)
+        comp_l.setSpacing(4)
+
+        self.attachments_lbl = QLabel("")
+        self.attachments_lbl.setWordWrap(True)
+        self.attachments_lbl.hide()
+        comp_l.addWidget(self.attachments_lbl)
+
+        # Single pill that contains text area + toolbar (like ChatGPT)
+        self.composer_inner = QFrame()
+        self.composer_inner.setObjectName("ai_composer_inner")
+        pill_l = QVBoxLayout(self.composer_inner)
+        pill_l.setContentsMargins(16, 12, 10, 8)
+        pill_l.setSpacing(8)
+
+        self.input_edit = QTextEdit()
+        self.input_edit.setPlaceholderText("Message Nova AI…")
+        self.input_edit.setFixedHeight(52)
+        self.input_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.input_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.input_edit.textChanged.connect(self._resize_input)
+        self.input_edit.installEventFilter(self)
+        pill_l.addWidget(self.input_edit)
+
+        # Toolbar row inside the pill: [📎 🎵 ✕] ···· [■/↑]
+        pill_bar = QHBoxLayout()
+        pill_bar.setContentsMargins(0, 0, 0, 0)
+        pill_bar.setSpacing(4)
+
+        self.attach_img_btn = QPushButton("🖼")
+        self.attach_img_btn.setFixedSize(30, 30)
+        self.attach_img_btn.setToolTip("Attach image (PNG, JPG, WEBP…)")
+        self.attach_img_btn.clicked.connect(self._attach_image)
+
+        self.attach_aud_btn = QPushButton("🎵")
+        self.attach_aud_btn.setFixedSize(30, 30)
+        self.attach_aud_btn.setToolTip("Attach audio (MP3, WAV, FLAC…)")
+        self.attach_aud_btn.clicked.connect(self._attach_audio)
+
+        self.clear_attach_btn = QPushButton("✕")
+        self.clear_attach_btn.setFixedSize(26, 26)
+        self.clear_attach_btn.setToolTip("Clear attachments")
+        self.clear_attach_btn.clicked.connect(self._clear_attachments)
+
+        self.send_btn = QPushButton("↑")
+        self.send_btn.setFixedSize(38, 38)
+        self.send_btn.setToolTip("Send (Enter)")
+        self.send_btn.clicked.connect(self._on_send_or_stop)
+
+        pill_bar.addWidget(self.attach_img_btn)
+        pill_bar.addWidget(self.attach_aud_btn)
+        pill_bar.addWidget(self.clear_attach_btn)
+        pill_bar.addStretch()
+        pill_bar.addWidget(self.send_btn)
+        pill_l.addLayout(pill_bar)
+
+        comp_l.addWidget(self.composer_inner)
+
+        self.hint_lbl = QLabel("Enter  ↑ send  ·  Shift+Enter  new line  ·  Esc  stop")
+        self.hint_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        comp_l.addWidget(self.hint_lbl)
+        layout.addWidget(self.composer)
+
+    def _build_welcome_page(self):
+        """ChatGPT-style welcome screen with centered content and suggestion chips."""
+        page = QWidget()
+        page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(32, 0, 32, 16)
+        outer.setSpacing(0)
+
+        outer.addStretch(4)
+
+        # Large gradient icon circle
+        self._welcome_icon_lbl = QLabel("✦")
+        self._welcome_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._welcome_icon_lbl.setFixedHeight(68)
+        self._welcome_icon_lbl.setFont(QFont("Segoe UI", 30, QFont.Weight.Bold))
+        outer.addWidget(self._welcome_icon_lbl)
+        outer.addSpacing(18)
+
+        # Headline
+        self._welcome_headline = QLabel("How can I help you?")
+        self._welcome_headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._welcome_headline.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
+        self._welcome_headline.setWordWrap(True)
+        outer.addWidget(self._welcome_headline)
+        outer.addSpacing(8)
+
+        # Subtitle
+        self._welcome_sub_lbl = QLabel("Private · Offline · No internet needed")
+        self._welcome_sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._welcome_sub_lbl.setFont(QFont("Segoe UI", 12))
+        self._welcome_sub_lbl.setWordWrap(True)
+        outer.addWidget(self._welcome_sub_lbl)
+        outer.addSpacing(36)
+
+        # Suggestion chips row (shown when model is loaded)
+        self._chips_frame = QFrame()
+        self._chips_frame.hide()
+        chips_l = QHBoxLayout(self._chips_frame)
+        chips_l.setContentsMargins(0, 0, 0, 0)
+        chips_l.setSpacing(10)
+        chips_l.addStretch()
+
+        _icons = ("🎵", "🎶", "📝", "✨")
+        self._chip_btns = []
+        for icon, suggestion in zip(_icons, self._SUGGESTIONS):
+            label = suggestion if len(suggestion) <= 26 else suggestion[:23] + "…"
+            btn = QPushButton(f"{icon}  {label}")
+            btn.setFixedHeight(40)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _checked, s=suggestion: self._fill_suggestion(s))
+            chips_l.addWidget(btn)
+            self._chip_btns.append(btn)
+
+        chips_l.addStretch()
+        outer.addWidget(self._chips_frame)
+        outer.addStretch(5)
+        return page
+
+    def _fill_suggestion(self, text):
+        self.input_edit.setPlainText(text)
+        self.input_edit.setFocus()
+        self._resize_input()
+
+    def _resize_input(self):
+        doc_h = self.input_edit.document().size().height()
+        h = int(min(140, max(52, doc_h + 20)))
+        if self.input_edit.height() != h:
+            self.input_edit.setFixedHeight(h)
+
+    def _on_send_or_stop(self):
+        if self._streaming_reply:
+            self._stop_generation()
+        else:
+            self._send_message()
+
+    def _on_chat_link(self, url):
+        link = url.toString()
+        if link.startswith("nova://copy/"):
+            try:
+                idx = int(link.rsplit("/", 1)[-1])
+                self._copy_message(idx)
+            except ValueError:
+                pass
+        elif link.startswith("nova://regen/"):
+            self._regenerate_last()
+        elif link.startswith("nova://suggest/"):
+            from urllib.parse import unquote
+            text = unquote(link[len("nova://suggest/"):])
+            if text:
+                self.input_edit.setPlainText(text)
+                self.input_edit.setFocus()
+                self._resize_input()
+
+    def _copy_message(self, block_idx):
+        if block_idx < 0 or block_idx >= len(self._display_blocks):
+            return
+        block = self._display_blocks[block_idx]
+        if block.get("role") not in ("assistant", "user"):
+            return
+        text = block.get("text", "")
+        if text:
+            QApplication.clipboard().setText(text)
+            t = self._theme()
+            self.status_pill.setText("● Copied")
+            self.status_pill.setStyleSheet(
+                f"color: {t['green']}; font-size: 11px; padding: 4px 10px; "
+                f"background: {t['highlight']}; border-radius: 12px;"
+            )
+            QTimer.singleShot(1500, self.refresh_status)
+
+    def _regenerate_last(self):
+        if self._streaming_reply or self._chat_worker is not None or self._llm is None:
+            return
+        if not self._messages:
+            return
+        if self._messages[-1].get("role") == "assistant":
+            self._messages.pop()
+        if self._display_blocks and self._display_blocks[-1].get("role") == "assistant":
+            self._display_blocks.pop()
+        while self._messages and self._messages[-1].get("role") != "user":
+            self._messages.pop()
+        if not self._messages:
+            return
+        self._begin_generation()
+
+    def _stop_generation(self):
+        if not self._chat_worker or not self._chat_worker.isRunning():
+            return
+        self._stop_requested = True
+        self._chat_worker.stop()
+        self.status_pill.setText("● Stopping…")
+        t = self._theme()
+        self.status_pill.setStyleSheet(
+            f"color: {t['accent2']}; font-size: 11px; padding: 4px 10px; "
+            f"background: {t['highlight']}; border-radius: 12px;"
+        )
+
+    def _toggle_settings_panel(self, visible):
+        self.settings_panel.setVisible(visible)
+
+    def _current_settings(self):
+        return {
+            "temperature": self.temp_spin.value(),
+            "top_p": self.top_p_spin.value(),
+            "top_k": self.top_k_spin.value(),
+            "max_tokens": self.max_tokens_spin.value(),
+            "device": self.device_combo.currentData() or "cpu",
+        }
+
+    def _on_settings_changed(self, *_args):
+        self._settings = self._current_settings()
+        _save_ai_chat_settings(self._settings)
+
+    def _on_device_changed(self, *_args):
+        if self._use_gpu() and not _ai_gpu_usable():
+            QMessageBox.information(
+                self,
+                "CPU mode recommended",
+                "GPU mode needs an NVIDIA GPU plus the CUDA build of llama-cpp-python.\n\n"
+                "You can chat on CPU without installing CUDA — just keep «CPU (recommended)» selected.",
+            )
+            self.device_combo.blockSignals(True)
+            self.device_combo.setCurrentIndex(self.device_combo.findData("cpu"))
+            self.device_combo.blockSignals(False)
+        self._refresh_device_controls()
+        self._on_settings_changed()
+
+    def _refresh_device_controls(self):
+        gpu_ok = _ai_gpu_usable()
+        gpu_idx = self.device_combo.findData("gpu")
+        if gpu_idx >= 0:
+            model = self.device_combo.model()
+            item = model.item(gpu_idx)
+            if item is not None:
+                item.setEnabled(gpu_ok)
+        if not gpu_ok and self._use_gpu():
+            self.device_combo.blockSignals(True)
+            self.device_combo.setCurrentIndex(self.device_combo.findData("cpu"))
+            self.device_combo.blockSignals(False)
+        self.device_hint_lbl.setText(_ai_inference_device_hint())
+        show_gpu_btn = _nvidia_gpu_detected() and not _llama_gpu_offload_available()
+        self.gpu_install_btn.setVisible(show_gpu_btn)
+        busy = (
+            (self._gpu_install_thread and self._gpu_install_thread.isRunning())
+            or (self._setup_thread and self._setup_thread.isRunning())
+        )
+        self.gpu_install_btn.setEnabled(show_gpu_btn and not busy)
+
+    def _install_gpu_support(self):
+        if self._gpu_install_thread and self._gpu_install_thread.isRunning():
+            return
+        if self._llm is not None:
+            QMessageBox.information(
+                self,
+                "Unload model first",
+                "Unload the model, then click Enable GPU, then Load again.",
+            )
+            return
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.gpu_install_btn.setEnabled(False)
+        if not self.settings_panel.isVisible():
+            self.settings_btn.setChecked(True)
+            self.settings_panel.setVisible(True)
+        self._gpu_install_thread = _LlamaGpuInstallThread()
+        self._gpu_install_thread.progress.connect(self._on_gpu_install_progress)
+        self._gpu_install_thread.finished_ok.connect(self._on_gpu_install_ok)
+        self._gpu_install_thread.failed.connect(self._on_gpu_install_failed)
+        self._gpu_install_thread.start()
+
+    def _on_gpu_install_progress(self, pct, msg):
+        if pct > 0:
+            self.progress.setValue(pct)
+        self.progress.setVisible(True)
+        t = self._theme()
+        self.status_pill.setText("● Installing GPU support…")
+        self.status_pill.setStyleSheet(
+            f"color: {t['accent2']}; font-size: 11px; padding: 4px 10px; "
+            f"background: {t['highlight']}; border-radius: 12px;"
+        )
+
+    def _on_gpu_install_ok(self):
+        self._gpu_install_thread = None
+        self.progress.setVisible(False)
+        self.device_combo.blockSignals(True)
+        self.device_combo.setCurrentIndex(self.device_combo.findData("gpu"))
+        self.device_combo.blockSignals(False)
+        self._on_settings_changed()
+        self._refresh_device_controls()
+        self._append_system(
+            "GPU support installed. Inference set to GPU — click Load to use your RTX card."
+        )
+        self.refresh_status()
+
+    def _on_gpu_install_failed(self, err):
+        self._gpu_install_thread = None
+        self.progress.setVisible(False)
+        self._append_system(f"GPU install failed: {err}")
+        self.refresh_status()
+
+    def _use_gpu(self):
+        return self._settings.get("device") == "gpu"
+
+    def _models_ready(self):
+        return os.path.isfile(_GEMMA_MODEL_PATH) and os.path.isfile(_GEMMA_MMPROJ_PATH)
+
+    def _update_attachments_label(self):
+        parts = []
+        for p in self._pending_images:
+            parts.append(f"🖼 {os.path.basename(p)}")
+        for p in self._pending_audio:
+            parts.append(f"🎵 {os.path.basename(p)}")
+        if parts:
+            self.attachments_lbl.setText("Attached: " + ", ".join(parts))
+            self.attachments_lbl.show()
+        else:
+            self.attachments_lbl.hide()
+
+    def _attach_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Attach image",
+            os.path.expanduser("~"),
+            "Images (*.png *.jpg *.jpeg *.webp *.gif *.bmp);;All Files (*.*)",
+        )
+        if path and path not in self._pending_images:
+            self._pending_images.append(path)
+            self._update_attachments_label()
+
+    def _attach_audio(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Attach audio",
+            os.path.expanduser("~"),
+            "Audio (*.wav *.mp3 *.flac *.ogg *.m4a *.aac);;All Files (*.*)",
+        )
+        if path and path not in self._pending_audio:
+            self._pending_audio.append(path)
+            self._update_attachments_label()
+
+    def _clear_attachments(self):
+        self._pending_images.clear()
+        self._pending_audio.clear()
+        self._update_attachments_label()
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if obj is self.input_edit and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape and self._streaming_reply:
+                self._stop_generation()
+                return True
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            ):
+                if self._streaming_reply:
+                    return True
+                self._send_message()
+                return True
+        return super().eventFilter(obj, event)
+
+    def refresh_status(self):
+        t = self._theme()
+        models_ready = self._models_ready()
+        if self._llm is not None:
+            if self._loaded_on_gpu:
+                gpu = _nvidia_gpu_name() or "GPU"
+                self.status_pill.setText(f"● GPU  ·  {gpu}")
+            else:
+                self.status_pill.setText("● CPU mode (heavy load)")
+            self.status_pill.setStyleSheet(
+                f"color: {t['green'] if self._loaded_on_gpu else t['subtext']}; "
+                f"font-size: 11px; padding: 4px 10px; background: {t['highlight']}; "
+                f"border-radius: 12px;"
+            )
+        elif models_ready and not _LLAMA_CPP_AVAILABLE:
+            self.status_pill.setText("● Engine broken — tap Load")
+            self.status_pill.setStyleSheet(
+                f"color: {t['red']}; font-size: 11px; padding: 4px 10px; "
+                f"background: {t['highlight']}; border-radius: 12px;"
+            )
+        elif models_ready:
+            self.status_pill.setText("● Downloaded — tap Load")
+            self.status_pill.setStyleSheet(
+                f"color: {t['accent2']}; font-size: 11px; padding: 4px 10px; "
+                f"background: {t['highlight']}; border-radius: 12px;"
+            )
+        else:
+            self.status_pill.setText("● Setup required")
+            self.status_pill.setStyleSheet(
+                f"color: {t['subtext']}; font-size: 11px; padding: 4px 10px; "
+                f"background: {t['highlight']}; border-radius: 12px;"
+            )
+
+        busy = self._setup_thread is not None and self._setup_thread.isRunning()
+        self.download_btn.setEnabled(not models_ready and not busy)
+        self.load_btn.setEnabled(models_ready and self._llm is None and not busy)
+        self.load_btn.setVisible(self._llm is None)
+        self.unload_btn.setEnabled(self._llm is not None and not self._streaming_reply)
+        self.unload_btn.setVisible(self._llm is not None)
+        can_chat = self._llm is not None and not self._streaming_reply
+        self.send_btn.setEnabled(can_chat or self._streaming_reply)
+        self.input_edit.setEnabled(can_chat)
+        self.attach_img_btn.setEnabled(can_chat)
+        self.attach_aud_btn.setEnabled(can_chat)
+        self.new_chat_btn.setEnabled(not self._streaming_reply)
+        self._style_send_btn(streaming=self._streaming_reply)
+        if not self._display_blocks and not self._streaming_reply:
+            self._render_empty_state()
+
+    def _start_download(self):
+        if self._models_ready():
+            return
+        if self._setup_thread and self._setup_thread.isRunning():
+            return
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.download_btn.setEnabled(False)
+        install_llama = not _LLAMA_CPP_AVAILABLE
+        self._setup_thread = _NovaAiSetupThread(install_llama, self._use_gpu())
+        self._setup_thread.progress.connect(self._on_setup_progress)
+        self._setup_thread.finished_ok.connect(self._on_setup_ok)
+        self._setup_thread.failed.connect(self._on_setup_failed)
+        self._setup_thread.start()
+
+    def _on_setup_progress(self, pct, msg):
+        if pct > 0:
+            self.progress.setValue(pct)
+        self.progress.setVisible(True)
+        if not self.settings_panel.isVisible():
+            self.settings_btn.setChecked(True)
+            self.settings_panel.setVisible(True)
+        t = self._theme()
+        self.status_pill.setText("● Downloading…")
+        self.status_pill.setStyleSheet(
+            f"color: {t['accent2']}; font-size: 11px; padding: 4px 10px; "
+            f"background: {t['highlight']}; border-radius: 12px;"
+        )
+
+    def _on_setup_ok(self):
+        self._setup_thread = None
+        self.progress.setVisible(False)
+        self.refresh_status()
+        self._append_system("Gemma 4 setup complete (llama-cpp-python + model + projector).")
+
+    def _on_setup_failed(self, err):
+        self._setup_thread = None
+        self.progress.setVisible(False)
+        t = self._theme()
+        self.status_pill.setText("● Setup failed")
+        self.status_pill.setStyleSheet(
+            f"color: {t['red']}; font-size: 11px; padding: 4px 10px; "
+            f"background: {t['highlight']}; border-radius: 12px;"
+        )
+        self._append_system(f"Setup failed: {err}")
+        self.refresh_status()
+
+    def _load_model(self):
+        if not _LLAMA_CPP_AVAILABLE:
+            if self._models_ready():
+                QMessageBox.warning(
+                    self,
+                    "Inference engine unavailable",
+                    _llama_cpp_unavailable_hint(self._use_gpu()),
+                )
+            else:
+                self._start_download()
+            return
+        if not self._models_ready():
+            QMessageBox.warning(
+                self,
+                "Model missing",
+                "Download Gemma 4 first (model + multimodal projector).",
+            )
+            return
+        if self._llm is not None:
+            return
+        t = self._theme()
+        self.status_pill.setText("● Loading…")
+        self.status_pill.setStyleSheet(
+            f"color: {t['accent2']}; font-size: 11px; padding: 4px 10px; "
+            f"background: {t['highlight']}; border-radius: 12px;"
+        )
+        self.load_btn.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            use_gpu = self._use_gpu() and _ai_gpu_usable()
+            if self._use_gpu() and not use_gpu:
+                self.device_combo.blockSignals(True)
+                self.device_combo.setCurrentIndex(self.device_combo.findData("cpu"))
+                self.device_combo.blockSignals(False)
+                self._on_settings_changed()
+                self._refresh_device_controls()
+            chat_handler = None
+            if _Gemma4ChatHandler is not None and os.path.isfile(_GEMMA_MMPROJ_PATH):
+                chat_handler = _Gemma4ChatHandler(
+                    clip_model_path=_GEMMA_MMPROJ_PATH,
+                    use_gpu=use_gpu,
+                    verbose=False,
+                )
+            self._llm = _LlamaCpp(
+                model_path=_GEMMA_MODEL_PATH,
+                chat_handler=chat_handler,
+                n_ctx=4096,
+                n_gpu_layers=-1 if use_gpu else 0,
+                n_threads=max(2, (os.cpu_count() or 4) - 1),
+                verbose=False,
+            )
+            self._loaded_on_gpu = use_gpu
+            dev = "GPU" if use_gpu else "CPU"
+            self._append_system(
+                f"{_GEMMA_MODEL_LABEL} loaded on {dev}. Image/audio attachments enabled."
+            )
+        except Exception as e:
+            self._llm = None
+            self._loaded_on_gpu = False
+            t = self._theme()
+            self.status_pill.setText("● Load failed")
+            self.status_pill.setStyleSheet(
+                f"color: {t['red']}; font-size: 11px; padding: 4px 10px; "
+                f"background: {t['highlight']}; border-radius: 12px;"
+            )
+            hint = ""
+            if self._use_gpu() and not _ai_gpu_usable():
+                hint = f" {_ai_inference_device_hint()}"
+            self._append_system(f"Failed to load model: {e}{hint}")
+        self.refresh_status()
+
+    def _unload_model(self):
+        if self._chat_worker and self._chat_worker.isRunning():
+            self._stop_generation()
+            self._chat_worker.wait(5000)
+        self._llm = None
+        self._loaded_on_gpu = False
+        self.refresh_status()
+        self._append_system("Model unloaded from memory.")
+
+    def _format_chat_block_html(self, block, block_idx=-1, is_last_assistant=False, streaming=False):
+        t = self._theme()
+        g = self._glass()
+        role = block.get("role")
+        text = block.get("text", "")
+
+        if role == "system":
+            icon = "ℹ"
+            return (
+                f'<div align="center" style="margin:18px 0 10px;">'
+                f'<span style="display:inline-flex;align-items:center;gap:6px;'
+                f'background:{g["chip"]};color:{t["subtext"]};'
+                f'padding:6px 16px;border-radius:20px;font-size:11.5px;'
+                f'border:1px solid {g["border"]};letter-spacing:0.3px;">'
+                f'<span style="opacity:0.7;">{icon}</span>'
+                f"{html.escape(text)}</span></div>"
+            )
+
+        if role == "user":
+            extra = block.get("attachments")
+            body = html.escape(text).replace("\n", "<br>")
+            attach_html = ""
+            if extra:
+                attach_html = (
+                    f'<div style="margin-top:6px;font-size:12px;opacity:0.85;">'
+                    f"📎 {html.escape(extra)}</div>"
+                )
+            # gradient bubble matching accent
+            return (
+                f'<div style="display:flex;justify-content:flex-end;margin:10px 0 6px;">'
+                f'<div style="max-width:78%;'
+                f'background:linear-gradient(135deg,{t["accent"]},{t["accent2"]});'
+                f'color:#ffffff;padding:12px 16px;'
+                f'border-radius:18px 18px 4px 18px;font-size:14px;line-height:1.6;'
+                f'box-shadow:0 2px 14px {t["accent"]}33;">'
+                f'{body}{attach_html}</div></div>'
+            )
+
+        if role == "assistant":
+            pal = _ai_ui_palette(t)
+            body = _nova_md_to_html(
+                text, pal["code_inline"], pal["code_block"],
+            ) if text else (
+                f'<span style="color:{t["subtext"]};font-size:22px;">…</span>'
+            )
+            cursor = (
+                f'<span style="display:inline-block;width:2px;height:15px;'
+                f'background:{t["accent"]};border-radius:1px;margin-left:2px;'
+                f'vertical-align:middle;opacity:0.9;"> </span>'
+                if streaming else ""
+            )
+
+            # action chips row
+            actions = ""
+            if text and not streaming and block_idx >= 0:
+                chip_base = (
+                    f"display:inline-flex;align-items:center;gap:4px;"
+                    f"margin-right:6px;margin-top:10px;padding:5px 12px;"
+                    f"border-radius:16px;background:{pal['surface']};"
+                    f"border:1px solid {pal['surface_border']};"
+                    f"color:{t['subtext']};font-size:11.5px;text-decoration:none;"
+                )
+                actions = f'<br><a href="nova://copy/{block_idx}" style="{chip_base}">⎘&nbsp;Copy</a>'
+                if is_last_assistant:
+                    actions += f'<a href="nova://regen/{block_idx}" style="{chip_base}">↺&nbsp;Regenerate</a>'
+
+            bubble_bg = t.get("_ai_bubble_ai_bg", g["bubble_ai"])
+            bubble_border = t.get("_ai_bubble_ai_border", g["border"])
+            return (
+                f'<div style="display:flex;align-items:flex-start;gap:10px;margin:10px 0 6px;">'
+                f'<div style="flex-shrink:0;width:28px;height:28px;margin-top:2px;'
+                f'border-radius:50%;display:flex;align-items:center;justify-content:center;'
+                f'background:linear-gradient(135deg,{t["accent"]},{t["accent2"]});'
+                f'color:#fff;font-size:11px;font-weight:700;">✦</div>'
+                f'<div style="max-width:78%;min-width:0;">'
+                f'<div style="background:{bubble_bg};'
+                f'border:1px solid {bubble_border};'
+                f'padding:12px 16px;border-radius:4px 18px 18px 18px;'
+                f'color:{t["text"]};font-size:14px;line-height:1.65;'
+                f'box-shadow:0 2px 10px rgba(0,0,0,0.2);">'
+                f'{body}{cursor}'
+                f'</div>'
+                f'{actions}'
+                f'</div></div>'
+            )
+        return ""
+
+    def _last_assistant_index(self):
+        for i in range(len(self._display_blocks) - 1, -1, -1):
+            if self._display_blocks[i].get("role") == "assistant":
+                return i
+        return -1
+
+    def _on_chat_scroll(self, value):
+        if self._chat_scroll_guard:
+            return
+        sb = self.chat_log.verticalScrollBar()
+        self._chat_pinned_bottom = value >= max(0, sb.maximum() - 48)
+
+    def _apply_chat_scroll(self, pinned, old_pos):
+        sb = self.chat_log.verticalScrollBar()
+        self._chat_scroll_guard = True
+        if pinned:
+            sb.setValue(sb.maximum())
+        else:
+            sb.setValue(min(old_pos, sb.maximum()))
+        self._chat_scroll_guard = False
+
+    def _render_empty_state(self):
+        # Switch the body stack to the welcome page (index 0)
+        self._body_stack.setCurrentIndex(0)
+
+        if self._llm is not None:
+            headline = "How can I help you?"
+            sub = "Private · Offline · No data leaves your computer"
+            show_chips = True
+        elif self._models_ready():
+            headline = "Almost ready"
+            sub = f"Open ⚙ settings and press Load model to start chatting."
+            show_chips = False
+        else:
+            headline = "Nova AI — Fully Offline"
+            sub = (
+                f"Private AI powered by {_GEMMA_MODEL_LABEL}.\n"
+                f"Open ⚙ settings to download and load the model."
+            )
+            show_chips = False
+
+        if hasattr(self, "_welcome_headline"):
+            self._welcome_headline.setText(headline)
+            self._welcome_sub_lbl.setText(sub)
+            self._chips_frame.setVisible(show_chips)
+        self._update_welcome_styles()
+
+    def _render_chat_log(self):
+        if not self._display_blocks and not self._streaming_reply:
+            self._render_empty_state()
+            return
+        # Switch body stack to chat log (index 1)
+        self._body_stack.setCurrentIndex(1)
+        t = self._theme()
+        g = self._glass()
+        last_asst = self._last_assistant_index()
+        parts = []
+        for i, b in enumerate(self._display_blocks):
+            parts.append(
+                self._format_chat_block_html(
+                    b,
+                    block_idx=i,
+                    is_last_assistant=(i == last_asst),
+                )
+            )
+        if self._streaming_reply:
+            parts.append(
+                self._format_chat_block_html(
+                    {"role": "assistant", "text": self._assistant_buffer},
+                    streaming=True,
+                )
+            )
+        doc = (
+            f"<div style='font-family:\"Segoe UI\",Arial,sans-serif;background:transparent;"
+            f"padding:12px 16px 32px;'>"
+            + "".join(parts)
+            + "</div>"
+        )
+        sb = self.chat_log.verticalScrollBar()
+        pinned = self._chat_pinned_bottom
+        old_pos = sb.value()
+        self.chat_log.setHtml(doc)
+        QTimer.singleShot(
+            0,
+            lambda p=pinned, o=old_pos: self._apply_chat_scroll(p, o),
+        )
+
+    def _append_system(self, text):
+        self._display_blocks.append({"role": "system", "text": text})
+        self._render_chat_log()
+
+    def _append_message(self, role, text, attachments=None):
+        block = {"role": role, "text": text}
+        if attachments:
+            block["attachments"] = attachments
+        self._display_blocks.append(block)
+        self._render_chat_log()
+
+    def _clear_chat(self):
+        if self._streaming_reply:
+            self._stop_generation()
+            if self._chat_worker and self._chat_worker.isRunning():
+                self._chat_worker.wait(3000)
+        self._messages.clear()
+        self._display_blocks.clear()
+        self._assistant_buffer = ""
+        self._streaming_reply = False
+        self._stop_requested = False
+        self.chat_log.clear()
+        self._clear_attachments()
+        self.refresh_status()
+        if not self._display_blocks:
+            self._render_empty_state()
+
+    def _begin_generation(self):
+        if self._llm is None or self._streaming_reply:
+            return
+        self._assistant_buffer = ""
+        self._streaming_reply = True
+        self._stop_requested = False
+        self._chat_pinned_bottom = True
+        self._render_chat_log()
+        self.refresh_status()
+
+        s = self._current_settings()
+        self._chat_worker = _GemmaChatWorker(
+            self._llm,
+            list(self._messages),
+            s["temperature"],
+            s["top_p"],
+            s["top_k"],
+            s["max_tokens"],
+        )
+        self._chat_worker.token.connect(self._on_token)
+        self._chat_worker.finished.connect(self._on_chat_finished)
+        self._chat_worker.failed.connect(self._on_chat_failed)
+        self._chat_worker.start()
+
+    def _send_message(self):
+        if self._llm is None or self._streaming_reply:
+            return
+        text = self.input_edit.toPlainText().strip()
+        if not text and not self._pending_images and not self._pending_audio:
+            return
+
+        images = list(self._pending_images)
+        audio = list(self._pending_audio)
+        content = _build_multimodal_user_content(text, images, audio)
+        attach_desc = ", ".join(
+            [os.path.basename(p) for p in images + audio]
+        )
+
+        self.input_edit.clear()
+        self._resize_input()
+        display_text = text or "(attachment only)"
+        self._append_message("user", display_text, attach_desc or None)
+        self._messages.append({"role": "user", "content": content})
+        self._clear_attachments()
+        self._begin_generation()
+
+    def _on_token(self, token):
+        self._assistant_buffer += token
+        self._render_chat_log()
+
+    def _on_chat_finished(self, finish_reason=""):
+        stopped = self._stop_requested or finish_reason == "stopped"
+        self._stop_requested = False
+        if self._assistant_buffer.strip():
+            self._messages.append({"role": "assistant", "content": self._assistant_buffer})
+            self._display_blocks.append(
+                {"role": "assistant", "text": self._assistant_buffer}
+            )
+            if finish_reason == "length":
+                self._append_system(
+                    "Reply truncated at max tokens — increase Max tokens in ⚙ settings."
+                )
+        elif stopped:
+            self._append_system("Generation stopped.")
+        else:
+            hint = ""
+            if finish_reason == "length":
+                hint = " Response hit the max token limit — raise Max tokens in ⚙ settings."
+            self._append_system(
+                f"Model returned no text.{hint} Try again or rephrase your message."
+            )
+        self._assistant_buffer = ""
+        self._streaming_reply = False
+        self._render_chat_log()
+        self._chat_worker = None
+        self.refresh_status()
+
+    def _on_chat_failed(self, err):
+        self._stop_requested = False
+        partial = self._assistant_buffer.strip()
+        if partial:
+            self._messages.append({"role": "assistant", "content": partial})
+            self._display_blocks.append({"role": "assistant", "text": partial})
+        self._assistant_buffer = ""
+        self._streaming_reply = False
+        self._chat_worker = None
+        self._append_system(f"Chat error: {err}")
+        self.refresh_status()
+
+    def shutdown(self):
+        if self._gpu_install_thread and self._gpu_install_thread.isRunning():
+            self._gpu_install_thread.wait(3000)
+        if self._setup_thread and self._setup_thread.isRunning():
+            self._setup_thread.stop()
+            self._setup_thread.wait(3000)
+        if self._chat_worker and self._chat_worker.isRunning():
+            self._chat_worker.stop()
+            self._chat_worker.wait(5000)
+        self._unload_model()
+
+
 # ──────────────────────────── EXTRAS PANEL ────────────────────────────
 
 class ExtrasPanel(QWidget):
@@ -6048,15 +9424,27 @@ class ExtrasPanel(QWidget):
             "Store, edit, and fill your logins and passwords securely using local AES-256 encryption.",
             self.open_password_vault
         )
-        self.card_coming = self._create_card(
-            "⚙", "More Coming Soon",
-            "Future updates will bring more productivity and automation tools right here.",
-            None, disabled=True
+        self._html_card_desc_ai = (
+            "Code + Preview tabs, plus an offline AI agent that writes HTML, CSS, and JavaScript."
+        )
+        self._html_card_desc_plain = (
+            "Edit HTML in the Code tab and run it in the Preview tab (PyQt6-WebEngine)."
+        )
+        self.card_html = self._create_card(
+            "🌐", "HTML Viewer",
+            self._html_card_desc_ai,
+            self.open_html_viewer
+        )
+        self.card_ai = self._create_card(
+            "🤖", "Nova AI Chat",
+            f"Offline assistant — download {_GEMMA_MODEL_LABEL} ({_GEMMA_MODEL_SIZE_HINT}) and chat without internet.",
+            self.open_ai_chat
         )
         
         grid.addWidget(self.card_autoclicker, 0, 0)
         grid.addWidget(self.card_password, 0, 1)
-        grid.addWidget(self.card_coming, 1, 0)
+        grid.addWidget(self.card_html, 1, 0)
+        grid.addWidget(self.card_ai, 1, 1)
         
         self.dash_layout.addLayout(grid)
         self.dash_layout.addStretch()
@@ -6070,9 +9458,59 @@ class ExtrasPanel(QWidget):
         # Password Vault View
         self.password_vault_view = PasswordManagerPanel(self.parent_player, self.db)
         self.stack.addWidget(self.password_vault_view)
+
+        # HTML Viewer
+        self.html_viewer_view = HtmlViewerPanel(self)
+        self.stack.addWidget(self.html_viewer_view)
+
+        # Offline AI Chat
+        self.ai_chat_view = NovaAiChatPanel(self)
+        self.stack.addWidget(self.ai_chat_view)
         
         self.layout.addWidget(self.stack)
-        
+        self.apply_theme_styles()
+        self.refresh_ai_features_visibility()
+
+    def refresh_ai_features_visibility(self):
+        """Apply Settings → Extras slider: show or hide unfinished AI tools."""
+        enabled = _extras_ai_features_enabled(self.db)
+        self.card_ai.setVisible(enabled)
+        self.html_viewer_view.set_agent_tab_visible(enabled)
+        if getattr(self.card_html, "_desc_lbl", None):
+            self.card_html._desc_lbl.setText(
+                self._html_card_desc_ai if enabled else self._html_card_desc_plain
+            )
+        if not enabled:
+            if self.stack.currentWidget() is self.ai_chat_view:
+                self.show_dashboard()
+            elif self.stack.currentWidget() is self.html_viewer_view:
+                idx = getattr(self.html_viewer_view, "_agent_tab_index", -1)
+                if idx >= 0 and self.html_viewer_view._tabs.currentIndex() == idx:
+                    self.html_viewer_view._tabs.setCurrentIndex(0)
+
+    def apply_theme_styles(self):
+        t = self.parent_player.theme if hasattr(self.parent_player, "theme") else THEMES["Midnight"]
+        pal = _ai_ui_palette(t)
+        self.title_label.setStyleSheet(
+            f"color: {t['text']}; background: transparent;"
+        )
+        card_ss = f"""
+            QFrame#extras_card {{
+                background-color: {t['card']};
+                border: 1px solid {t['border']};
+                border-radius: 12px;
+            }}
+            QFrame#extras_card:hover {{
+                border-color: {pal['accent']};
+                background-color: {pal['highlight']};
+            }}
+        """
+        for card in (
+            self.card_autoclicker, self.card_password,
+            self.card_html, self.card_ai,
+        ):
+            card.setStyleSheet(card_ss)
+
     def _create_card(self, icon, title, desc, callback, disabled=False):
         card = QFrame()
         card.setObjectName("extras_card")
@@ -6093,12 +9531,11 @@ class ExtrasPanel(QWidget):
         desc_lbl.setWordWrap(True)
         desc_lbl.setStyleSheet("color: #8892b0; font-size: 12px;")
         lay.addWidget(desc_lbl)
+        card._desc_lbl = desc_lbl
         
         lay.addStretch()
         
-        t = self.parent_player.theme if hasattr(self.parent_player, "theme") else {
-            "card": "#181824", "border": "#27273a", "accent": "#5b8dee", "text": "#e8ecf4"
-        }
+        t = self.parent_player.theme if hasattr(self.parent_player, "theme") else THEMES["Midnight"]
         
         if disabled:
             card.setStyleSheet(f"""
@@ -6110,17 +9547,6 @@ class ExtrasPanel(QWidget):
                 }}
             """)
         else:
-            card.setStyleSheet(f"""
-                QFrame#extras_card {{
-                    background-color: {t['card']};
-                    border: 1px solid {t['border']};
-                    border-radius: 12px;
-                }}
-                QFrame#extras_card:hover {{
-                    border-color: {t['accent']};
-                    background-color: {t['highlight']};
-                }}
-            """)
             if callback:
                 card.mouseReleaseEvent = lambda event: callback()
                 card.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -6132,8 +9558,11 @@ class ExtrasPanel(QWidget):
         self.back_btn.setVisible(False)
         self.title_label.setText("⚡  Extras")
         
-        if self.stack.currentIndex() == 2:
+        if self.stack.currentWidget() is self.password_vault_view:
             self.password_vault_view.lock()
+        if self.stack.currentWidget() is self.html_viewer_view:
+            self.html_viewer_view.exit_fullscreen_if_open()
+            self.html_viewer_view.stop_agent_if_running()
             
         self.stack.setCurrentIndex(0)
         self.parent_player.status_label.setText("Extras  ·  Utility tools")
@@ -6151,6 +9580,22 @@ class ExtrasPanel(QWidget):
         self.stack.setCurrentIndex(2)
         self.password_vault_view.refresh()
         self.parent_player.status_label.setText("Password Manager  ·  Encrypted local vault")
+
+    def open_html_viewer(self):
+        self.back_btn.setVisible(True)
+        self.title_label.setText("🌐  HTML Viewer")
+        self.stack.setCurrentIndex(3)
+        self.html_viewer_view.apply_theme_styles()
+        self.html_viewer_view._refresh_agent_controls()
+        self.parent_player.status_label.setText("HTML Viewer  ·  Code · Preview · AI Agent")
+
+    def open_ai_chat(self):
+        self.back_btn.setVisible(True)
+        self.title_label.setText("🤖  Nova AI Chat")
+        self.stack.setCurrentIndex(4)
+        self.ai_chat_view.apply_theme_styles()
+        self.ai_chat_view.refresh_status()
+        self.parent_player.status_label.setText(f"Nova AI Chat  ·  Offline {_GEMMA_MODEL_LABEL}")
 
 
 # ──────────────────────────── THUMBNAIL WORKER ────────────────────────────
@@ -8764,6 +12209,54 @@ class SmoothListWidget(QListWidget):
         self._velocity *= self._FRICTION
 
 
+class CoverLabel(QLabel):
+    """Album cover that scales smoothly from one cached source image."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._source = QPixmap()
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def set_cover_from_path(self, path: str):
+        self.setText("")
+        if path and os.path.exists(path):
+            self._source = QPixmap(path)
+        else:
+            self._source = QPixmap()
+        self.update()
+
+    def show_placeholder(self, symbol="♫", font_size=48):
+        self._source = QPixmap()
+        self.setText(symbol)
+        self.setFont(QFont("Arial", font_size))
+
+    def has_cover(self):
+        return not self._source.isNull()
+
+    def display_pixmap(self) -> QPixmap:
+        if not self._source.isNull():
+            return self._source
+        px = self.pixmap()
+        return px if px is not None and not px.isNull() else QPixmap()
+
+    def paintEvent(self, event):
+        if self._source.isNull():
+            return super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        scaled = self._source.scaled(
+            rect.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = rect.x() + (rect.width() - scaled.width()) // 2
+        y = rect.y() + (rect.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+
+
 class SmoothScrollArea(QScrollArea):
     """
     QScrollArea with kinetic smooth scrolling for manual mouse-wheel use.
@@ -9735,6 +13228,59 @@ class DiscordRPC:
 
 # ──────────────────────────── LYRICS FETCHER ────────────────────────────
 
+_LYRICS_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "nova_lyrics_cache.json.gz",
+)
+_LYRICS_CACHE_SEP = "\u241f"
+_LYRICS_CACHE_MAX = 400
+_LYRICS_TIMEOUT_FAST = 3.5
+_LYRICS_TIMEOUT_SLOW = 5.0
+
+
+def _load_lyrics_disk_cache():
+    """Load compressed lyrics cache from disk into {(artist, title): [lines]}."""
+    if not os.path.exists(_LYRICS_CACHE_FILE):
+        return {}
+    try:
+        with gzip.open(_LYRICS_CACHE_FILE, "rt", encoding="utf-8") as f:
+            payload = json.load(f)
+        entries = payload.get("entries", {}) if isinstance(payload, dict) else {}
+        cache = {}
+        for raw_key, raw_value in entries.items():
+            if _LYRICS_CACHE_SEP not in raw_key:
+                continue
+            artist, title = raw_key.split(_LYRICS_CACHE_SEP, 1)
+            if isinstance(raw_value, str):
+                lines = raw_value.split("\n")
+            elif isinstance(raw_value, list):
+                lines = [str(x) for x in raw_value]
+            else:
+                continue
+            cache[(artist, title)] = lines
+        return cache
+    except Exception:
+        return {}
+
+
+def _save_lyrics_disk_cache(cache):
+    """Persist latest lyrics cache entries in a compact gzip file."""
+    try:
+        items = list(cache.items())[-_LYRICS_CACHE_MAX:]
+        payload = {
+            "version": 1,
+            "entries": {
+                f"{artist}{_LYRICS_CACHE_SEP}{title}": "\n".join(lines)
+                for (artist, title), lines in items
+                if artist or title
+            },
+        }
+        with gzip.open(_LYRICS_CACHE_FILE, "wt", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        pass
+
+
 class LyricsFetcher(QThread):
     """Fetches lyrics with multiple APIs and smart title cleaning."""
     lyrics_ready   = pyqtSignal(str, list)
@@ -9758,12 +13304,106 @@ class LyricsFetcher(QThread):
                       '', text, flags=re.IGNORECASE)
         return text.strip()
 
+    @staticmethod
+    def sanitize_lyrics_text(raw: str) -> str:
+        """Remove common junk from scraped lyrics and reject partial/bad matches."""
+        import re
+
+        if not raw:
+            return ""
+
+        text = str(raw).replace("\r\n", "\n").replace("\r", "\n")
+        text = text.replace("\xa0", " ")
+
+        # Common Genius-like prefixes / suffixes that are not song lyrics.
+        text = re.sub(
+            r'^\s*\d+\s+Contributors?.*?Lyrics\s*',
+            '',
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        text = re.sub(r'^\s*Lyrics\s*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'^\s*Translations?.*$', '', text, flags=re.IGNORECASE | re.MULTILINE)
+        text = re.sub(r'^\s*See .* Live\s*$', '', text, flags=re.IGNORECASE | re.MULTILINE)
+        text = re.sub(r'^\s*You might also like\s*$', '', text, flags=re.IGNORECASE | re.MULTILINE)
+        text = re.sub(r'^\s*Read More\s*$', '', text, flags=re.IGNORECASE | re.MULTILINE)
+        text = re.sub(r'\b\d*\s*Embed\s*$', '', text, flags=re.IGNORECASE)
+
+        bad_line_patterns = [
+            r'^\s*\d+\s+Contributors?.*$',
+            r'^\s*Translations?.*$',
+            r'^\s*You might also like\s*$',
+            r'^\s*Read More\s*$',
+            r'^\s*Embed\s*$',
+            r'^\s*\d+\s*Embed\s*$',
+        ]
+
+        cleaned_lines = []
+        for line in text.split("\n"):
+            line = re.sub(r'\s+', ' ', line).strip()
+            if not line:
+                if cleaned_lines and cleaned_lines[-1] != "":
+                    cleaned_lines.append("")
+                continue
+            if any(re.match(pat, line, flags=re.IGNORECASE) for pat in bad_line_patterns):
+                continue
+            cleaned_lines.append(line)
+
+        while cleaned_lines and cleaned_lines[0] == "":
+            cleaned_lines.pop(0)
+        while cleaned_lines and cleaned_lines[-1] == "":
+            cleaned_lines.pop()
+
+        text = "\n".join(cleaned_lines)
+        while "\n\n\n" in text:
+            text = text.replace("\n\n\n", "\n\n")
+
+        non_empty_lines = [ln for ln in text.split("\n") if ln.strip()]
+        lower = text.lower()
+
+        # Reject obvious bad/partial scraps so earlier providers can win.
+        if any(token in lower for token in ("contributors", "you might also like", "read more", " embed")):
+            return ""
+        if len(non_empty_lines) < 4 and len(text) < 140:
+            return ""
+
+        return text.strip()
+
+    @staticmethod
+    def _score_lyrics_candidate(raw: str, source: str, exact_match: bool) -> int:
+        """Heuristic: prefer fuller lyrics over partial snippets."""
+        if not raw:
+            return -1
+        non_empty_lines = [ln for ln in raw.split("\n") if ln.strip()]
+        chars = len(raw)
+        score = len(non_empty_lines) * 12 + min(chars, 5000) // 18
+        if exact_match:
+            score += 120
+        if source == "lrclib":
+            score += 80
+        elif source == "lrclib/search":
+            score += 55
+        elif source == "lyrics.ovh":
+            score += 25
+        elif source == "genius":
+            score += 10
+        # Short snippets that start mid-song are usually weak matches.
+        if len(non_empty_lines) < 8:
+            score -= 120
+        elif len(non_empty_lines) < 14:
+            score -= 40
+        if chars < 220:
+            score -= 140
+        elif chars < 420:
+            score -= 45
+        return score
+
     def _try_lyrics_ovh(self, artist: str, title: str):
         a = urllib.parse.quote(artist)
         t = urllib.parse.quote(title)
         url = f"https://api.lyrics.ovh/v1/{a}/{t}"
         req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
             data = json.loads(resp.read().decode())
         return data.get("lyrics", "").strip()
 
@@ -9772,7 +13412,7 @@ class LyricsFetcher(QThread):
         params = urllib.parse.urlencode({"artist_name": artist, "track_name": title})
         url = f"https://lrclib.net/api/get?{params}"
         req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
             data = json.loads(resp.read().decode())
         # Prefer plain lyrics; fall back to synced (strip timestamps)
         plain = (data.get("plainLyrics") or "").strip()
@@ -9791,20 +13431,25 @@ class LyricsFetcher(QThread):
         params = urllib.parse.urlencode({"q": f"{artist} {title}".strip()})
         url = f"https://lrclib.net/api/search?{params}"
         req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
             results = json.loads(resp.read().decode())
         if not isinstance(results, list):
             return ""
+        best = ""
         for item in results[:5]:
             plain = (item.get("plainLyrics") or "").strip()
             if plain:
-                return plain
+                cleaned = self.sanitize_lyrics_text(plain)
+                if len(cleaned) > len(best):
+                    best = cleaned
             synced = (item.get("syncedLyrics") or "").strip()
             if synced:
                 import re
                 plain = re.sub(r'^\[\d+:\d+\.\d+\]\s*', '', synced, flags=re.MULTILINE)
-                return plain.strip()
-        return ""
+                cleaned = self.sanitize_lyrics_text(plain.strip())
+                if len(cleaned) > len(best):
+                    best = cleaned
+        return best
 
     def _try_genius(self, artist: str, title: str):
         """Genius search scrape — no API key needed."""
@@ -9815,7 +13460,7 @@ class LyricsFetcher(QThread):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
         })
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
             data = json.loads(resp.read().decode())
         # Find the first song result
         song_url = ""
@@ -9831,7 +13476,7 @@ class LyricsFetcher(QThread):
         req2 = urllib.request.Request(song_url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         })
-        with urllib.request.urlopen(req2, timeout=10) as resp2:
+        with urllib.request.urlopen(req2, timeout=_LYRICS_TIMEOUT_SLOW) as resp2:
             html = resp2.read().decode("utf-8", errors="replace")
         # Extract text from data-lyrics-container divs
         containers = re.findall(r'data-lyrics-container="true"[^>]*>(.*?)</div>', html, re.DOTALL)
@@ -9846,10 +13491,12 @@ class LyricsFetcher(QThread):
             # Decode HTML entities
             block = block.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&#x27;", "'").replace("&quot;", '"')
             lines.append(block.strip())
-        return "\n".join(lines).strip()
+        return self.sanitize_lyrics_text("\n".join(lines))
 
     def run(self):
         raw   = ""
+        best_raw = ""
+        best_score = -1
         tried = []
 
         print(f"[Lyrics] Searching for: artist={self.artist!r}  title={self.title!r}")
@@ -9888,60 +13535,59 @@ class LyricsFetcher(QThread):
                 _seen.add(key)
                 _attempts.append((_a, _t))
 
-        for attempt_artist, attempt_title in _attempts:
+        for idx, (attempt_artist, attempt_title) in enumerate(_attempts):
             if not attempt_title:
                 continue
 
             print(f"[Lyrics] Trying: {attempt_artist!r} / {attempt_title!r}")
 
-            # 1. lrclib exact
-            try:
-                raw = self._try_lrclib(attempt_artist, attempt_title)
-                if raw:
-                    print(f"[Lyrics] Found via lrclib ({len(raw)} chars)")
-                    break
-            except Exception as e:
-                tried.append(f"lrclib: {e}")
-                print(f"[Lyrics]   lrclib failed: {e}")
+            exact_match = idx == 0
 
-            # 2. lrclib search (fuzzy)
-            try:
-                raw = self._try_lrclib_search(attempt_artist, attempt_title)
-                if raw:
-                    print(f"[Lyrics] Found via lrclib/search ({len(raw)} chars)")
-                    break
-            except Exception as e:
-                tried.append(f"lrclib_search: {e}")
-                print(f"[Lyrics]   lrclib_search failed: {e}")
+            def _consider(candidate_raw: str, source: str):
+                nonlocal best_raw, best_score
+                cleaned = self.sanitize_lyrics_text(candidate_raw)
+                if not cleaned:
+                    return False
+                score = self._score_lyrics_candidate(cleaned, source, exact_match)
+                print(f"[Lyrics] Candidate {source}: score={score} chars={len(cleaned)}")
+                if score > best_score:
+                    best_score = score
+                    best_raw = cleaned
+                # Strong exact match: stop early.
+                return score >= 420 and exact_match
 
-            # 3. lyrics.ovh
-            try:
-                raw = self._try_lyrics_ovh(attempt_artist, attempt_title)
-                if raw:
-                    print(f"[Lyrics] Found via lyrics.ovh ({len(raw)} chars)")
-                    break
-            except Exception as e:
-                tried.append(f"lyrics.ovh: {e}")
-                print(f"[Lyrics]   lyrics.ovh failed: {e}")
+            providers = [
+                ("lrclib", self._try_lrclib),
+                ("lrclib/search", self._try_lrclib_search),
+                ("lyrics.ovh", self._try_lyrics_ovh),
+            ]
+            if idx == 0:
+                providers.append(("genius", self._try_genius))
 
-            # 4. Genius scrape
-            try:
-                raw = self._try_genius(attempt_artist, attempt_title)
-                if raw:
-                    print(f"[Lyrics] Found via Genius ({len(raw)} chars)")
-                    break
-            except Exception as e:
-                tried.append(f"genius: {e}")
-                print(f"[Lyrics]   genius failed: {e}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as executor:
+                future_map = {
+                    executor.submit(func, attempt_artist, attempt_title): source
+                    for source, func in providers
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    source = future_map[future]
+                    try:
+                        raw = future.result()
+                        if raw and _consider(raw, source):
+                            break
+                    except Exception as e:
+                        tried.append(f"{source}: {e}")
+                        print(f"[Lyrics]   {source} failed: {e}")
 
+            if best_score >= 420 and exact_match:
+                break
+
+        raw = best_raw
         if not raw:
             print(f"[Lyrics] Not found. Errors: {tried}")
             self.lyrics_failed.emit("No lyrics found.")
             return
 
-        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-        while "\n\n\n" in raw:
-            raw = raw.replace("\n\n\n", "\n\n")
         lines = raw.split("\n")
         self.lyrics_ready.emit(raw, lines)
 
@@ -9996,7 +13642,7 @@ class NovaPlayer(QWidget):
         self._lyrics_timestamps   = []     # list[float] — ms offset per line (estimated)
         self._lyrics_current_line = -1     # index of highlighted line
         self._lyrics_fetcher      = None   # active LyricsFetcher thread
-        self._lyrics_cache        = {}     # {(artist.lower(), title.lower()): lines} in-memory cache
+        self._lyrics_cache        = _load_lyrics_disk_cache()  # persisted compact cache
         self._lyrics_current_key  = None   # cache key for currently displayed lyrics
         self._lyrics_song_id      = None   # song DB id for the currently loading lyrics
         self._lyrics_video_id     = None   # video DB id for the currently loading lyrics
@@ -10036,7 +13682,10 @@ class NovaPlayer(QWidget):
         self._discord_timer.start(1000)
 
         self._shortcuts_active = True
+        self._pre_mute_volume = None
+        self._media_keys_thread = None
         self._setup_shortcuts()
+        self._start_global_media_keys()
 
         self._ext_last_status = {"state": "idle"}
         self._ext_server = NovaExtensionServer(self)
@@ -10997,29 +14646,33 @@ window.addEventListener("unload", () => {
         # ── RIGHT PANEL ──
         right = QFrame()
         right.setObjectName("right_panel")
-        right.setMinimumWidth(280)
-        right.setMaximumWidth(340)
+        # Keep the panel width stable so toggling lyrics never changes layout width.
+        right.setFixedWidth(340)
         right.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout()
         right_layout.setContentsMargins(20, 28, 20, 20)
-        right_layout.setSpacing(12)
+        right_layout.setSpacing(8)
 
         # ── Cover / Video Stack ──
+        self._COVER_OUTER_FULL = 248
+        self._COVER_OUTER_COMPACT = 168
+        self._COVER_INNER_MARGIN = 8
+
         self.cover_stack = QStackedWidget()
-        self.cover_stack.setFixedSize(248, 248)
-        # Prevent the cover from being pushed around when the lyrics panel
-        # expands: Fixed policy means Qt will never grow or shrink this widget.
+        self.cover_stack.setFixedSize(self._COVER_OUTER_FULL, self._COVER_OUTER_FULL)
         self.cover_stack.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         # Page 0: album cover (music mode)
-        cover_container = QFrame()
-        cover_container.setObjectName("cover_container")
-        cover_container.setFixedSize(248, 248)
-        cover_inner = QVBoxLayout(cover_container)
+        self._cover_container = QFrame()
+        self._cover_container.setObjectName("cover_container")
+        self._cover_container.setFixedSize(self._COVER_OUTER_FULL, self._COVER_OUTER_FULL)
+        cover_inner = QVBoxLayout(self._cover_container)
         cover_inner.setContentsMargins(4, 4, 4, 4)
-        self.cover_label = QLabel()
-        self.cover_label.setFixedSize(240, 240)
-        self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover_label = CoverLabel()
+        self.cover_label.setFixedSize(
+            self._COVER_OUTER_FULL - self._COVER_INNER_MARGIN,
+            self._COVER_OUTER_FULL - self._COVER_INNER_MARGIN,
+        )
         self.cover_label.mouseDoubleClickEvent = lambda e: self._open_cover_fullscreen()
         self.cover_label.setCursor(Qt.CursorShape.PointingHandCursor)
         cover_inner.addWidget(self.cover_label)
@@ -11027,13 +14680,14 @@ window.addEventListener("unload", () => {
         # Page 1: embedded VLC video frame (video mode)
         self.video_frame = QFrame()
         self.video_frame.setObjectName("cover_container")
-        self.video_frame.setFixedSize(248, 248)
+        self.video_frame.setFixedSize(self._COVER_OUTER_FULL, self._COVER_OUTER_FULL)
         self.video_frame.setStyleSheet("background: #000; border-radius: 14px;")
         self.video_frame.mouseDoubleClickEvent = lambda e: self._open_video_fullscreen()
 
-        self.cover_stack.addWidget(cover_container)   # index 0
+        self.cover_stack.addWidget(self._cover_container)   # index 0
         self.cover_stack.addWidget(self.video_frame)  # index 1
         self.cover_stack.setCurrentIndex(0)
+        self._right_panel_layout = right_layout
         right_layout.addWidget(self.cover_stack, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Fullscreen button for cover/video
@@ -11186,10 +14840,16 @@ window.addEventListener("unload", () => {
         self._lyrics_wrapper = QWidget()
         self._lyrics_wrapper.setMaximumHeight(0)   # collapsed by default
         self._lyrics_wrapper.setMinimumHeight(0)
+        self._lyrics_wrapper.setVisible(False)
         self._lyrics_wrapper_layout = QVBoxLayout(self._lyrics_wrapper)
         self._lyrics_wrapper_layout.setContentsMargins(0, 0, 0, 0)
         self._lyrics_wrapper_layout.setSpacing(0)
         self._lyrics_expanded = False
+        self._lyrics_target_height = 280
+        self._lyrics_target_height_maximized = 360
+        self._lyrics_anim_group = None
+        self._cover_size_anim = None
+        self._lyrics_opacity_anim = None
 
         self._lyrics_box = SmoothScrollArea()
         self._lyrics_box.setWidgetResizable(True)
@@ -11204,13 +14864,15 @@ window.addEventListener("unload", () => {
         self._lyrics_content.setTextFormat(Qt.TextFormat.PlainText)
         self._lyrics_content.setMargin(6)
         self._lyrics_box.setWidget(self._lyrics_content)
+        self._lyrics_opacity = QGraphicsOpacityEffect(self._lyrics_box)
+        self._lyrics_opacity.setOpacity(0.0)
+        self._lyrics_box.setGraphicsEffect(self._lyrics_opacity)
         self._lyrics_wrapper_layout.addWidget(self._lyrics_box)
 
-        # ── FIX: Stretch goes BEFORE the lyrics wrapper so that expanding
-        # lyrics only grows downward into the tools row gap, and never
-        # pushes the cover/video upward. ──────────────────────────────────
-        right_layout.addStretch()
         right_layout.addWidget(self._lyrics_wrapper)
+        # Keep tools at the bottom while letting the lyrics sit directly
+        # under the lyrics header button.
+        right_layout.addStretch()
 
         tools_row = QHBoxLayout()
         tools_row.setSpacing(8)
@@ -11225,6 +14887,7 @@ window.addEventListener("unload", () => {
         right_layout.addLayout(tools_row)
 
         right.setLayout(right_layout)
+        self._update_lyrics_maximized_layout()
 
         main.addWidget(self.sidebar)
         main.addWidget(center, 1)
@@ -11381,6 +15044,66 @@ window.addEventListener("unload", () => {
         _sc("Ctrl+I",     self.import_single_files)
         _sc("F5",         self.load_library)
         _sc("F11",        self._toggle_window_fullscreen)
+
+        # Media keys (when Nova window is focused)
+        def _vol_up():
+            self.volume_slider.setValue(min(100, self.volume_slider.value() + 5))
+        def _vol_down():
+            self.volume_slider.setValue(max(0, self.volume_slider.value() - 5))
+
+        _sc(Qt.Key.Key_MediaTogglePlayPause, self.toggle_play_pause)
+        _sc(Qt.Key.Key_MediaPlay, self.resume_song)
+        _sc(Qt.Key.Key_MediaPause, self.pause_song)
+        _sc(Qt.Key.Key_MediaNext, self.play_next)
+        _sc(Qt.Key.Key_MediaPrevious, self.play_previous)
+        _sc(Qt.Key.Key_MediaStop, self.stop_song)
+        _sc(Qt.Key.Key_VolumeUp, _vol_up)
+        _sc(Qt.Key.Key_VolumeDown, _vol_down)
+        _sc(Qt.Key.Key_VolumeMute, self._toggle_player_mute)
+
+    def _toggle_player_mute(self):
+        """Mute or restore VLC volume (also used by media-key mute)."""
+        if self.volume_slider.value() > 0:
+            self._pre_mute_volume = self.volume_slider.value()
+            self.volume_slider.setValue(0)
+        else:
+            restore = self._pre_mute_volume if self._pre_mute_volume else int(
+                self.db.get_setting("default_volume", "80")
+            )
+            self.volume_slider.setValue(restore)
+
+    def _start_global_media_keys(self):
+        self._stop_global_media_keys()
+        if sys.platform != "win32":
+            return
+        if self.db.get_setting("global_media_keys", "1") != "1":
+            return
+        self._media_keys_thread = GlobalMediaKeysThread()
+        self._media_keys_thread.triggered.connect(self._on_global_media_key)
+        self._media_keys_thread.start()
+
+    def _stop_global_media_keys(self):
+        if self._media_keys_thread:
+            self._media_keys_thread.stop()
+            self._media_keys_thread.wait(3000)
+            self._media_keys_thread = None
+
+    def _on_global_media_key(self, action: str):
+        """Handle keyboard media keys registered globally (Windows)."""
+        if action == "play_pause":
+            self.toggle_play_pause()
+        elif action == "next":
+            self.play_next()
+        elif action == "prev":
+            self.play_previous()
+        elif action == "stop":
+            self.stop_song()
+        elif action == "vol_up":
+            self.volume_slider.setValue(min(100, self.volume_slider.value() + 5))
+        elif action == "vol_down":
+            self.volume_slider.setValue(max(0, self.volume_slider.value() - 5))
+        elif action == "mute":
+            self._toggle_player_mute()
 
     def _focused_widget_is_text_input(self):
         """Returns True if a text input widget currently has keyboard focus."""
@@ -12075,6 +15798,7 @@ window.addEventListener("unload", () => {
             sb.setStyleSheet(
                 f"QPushButton {{ background: transparent; font-size: {scaled_font_size}px; color: {t['subtext']}; border: none; }}"
             )
+        self._update_stars(getattr(self, "_current_rating", 0))
 
         self.status_label.setStyleSheet(f"color: {t['subtext']}; font-size: {small_font_size}px; background: transparent;")
 
@@ -12097,6 +15821,12 @@ window.addEventListener("unload", () => {
             self._apply_liquid_glass_theme(t, scaled_font_size, small_font_size, large_font_size, font_family)
         else:
             self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        if getattr(self, "extras_panel", None):
+            self.extras_panel.apply_theme_styles()
+            self.extras_panel.autoclicker_view.apply_theme_styles()
+            self.extras_panel.html_viewer_view.apply_theme_styles()
+            self.extras_panel.ai_chat_view.apply_theme_styles()
 
     def _apply_liquid_glass_theme(self, t, fs, ss, ls, ff):
         """
@@ -12709,6 +16439,7 @@ window.addEventListener("unload", () => {
             sb.setStyleSheet(
                 f"QPushButton {{ background: transparent; font-size: {fs}px; color: {text_sub}; border: none; }}"
             )
+        self._update_stars(getattr(self, "_current_rating", 0))
         self.status_label.setStyleSheet(
             f"color: {text_sub}; font-size: {ss}px; background: transparent;"
         )
@@ -12726,6 +16457,11 @@ window.addEventListener("unload", () => {
     def switch_view(self, view):
         if self.current_view == "extras" and view != "extras":
             self.password_manager.lock()
+            try:
+                self.extras_panel.html_viewer_view.exit_fullscreen_if_open()
+                self.extras_panel.html_viewer_view.stop_agent_if_running()
+            except Exception:
+                pass
 
         self.current_view = view
         self.current_playlist_id = None
@@ -13545,12 +17281,7 @@ window.addEventListener("unload", () => {
 
             if cover_path and os.path.exists(cover_path):
                 self.current_cover_path = cover_path
-                px = QPixmap(cover_path).scaled(
-                    240, 240,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                self.cover_label.setPixmap(px)
+                self.cover_label.set_cover_from_path(cover_path)
                 px_small = QPixmap(cover_path).scaled(
                     52, 52,
                     Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -13559,9 +17290,7 @@ window.addEventListener("unload", () => {
                 self.bb_cover.setPixmap(px_small)
             else:
                 self.current_cover_path = None
-                self.cover_label.clear()
-                self.cover_label.setText("♫")
-                self.cover_label.setFont(QFont("Arial", 48))
+                self.cover_label.show_placeholder("♫", 48)
                 self.bb_cover.clear()
                 self.bb_cover.setText("♫")
                 self.bb_cover.setFont(QFont("Arial", 20))
@@ -13890,6 +17619,7 @@ window.addEventListener("unload", () => {
                         and self._lyrics_timestamps
                         and not self.is_video_mode
                         and not self._crossfade_active
+                        and self._lyrics_expanded
                         and self._lyrics_box.isVisible()):
                     # Find the last line whose timestamp <= current position
                     new_line = -1
@@ -14037,12 +17767,13 @@ window.addEventListener("unload", () => {
         self._update_stars(rating)
 
     def _update_stars(self, rating):
+        self._current_rating = rating
         t = self.theme
         for i, btn in enumerate(self.star_btns):
             if i < rating:
                 btn.setText("★")
                 btn.setStyleSheet(
-                    "QPushButton { background: transparent; font-size: 15px; color: #f0b429; border: none; }"
+                    f"QPushButton {{ background: transparent; font-size: 15px; color: {t['accent']}; border: none; }}"
                 )
             else:
                 btn.setText("☆")
@@ -14074,8 +17805,7 @@ window.addEventListener("unload", () => {
     def _open_cover_fullscreen(self):
         """Show cover art fullscreen inside the main window as an overlay — full resolution."""
         if not self.current_cover_path or not os.path.exists(self.current_cover_path):
-            # fallback: use whatever is in the label
-            if not self.cover_label.pixmap() or self.cover_label.pixmap().isNull():
+            if not self.cover_label.has_cover():
                 return
         if hasattr(self, "_fs_overlay") and self._fs_overlay is not None:
             return
@@ -14097,7 +17827,7 @@ window.addEventListener("unload", () => {
         if self.current_cover_path and os.path.exists(self.current_cover_path):
             src_px = QPixmap(self.current_cover_path)
         else:
-            src_px = self.cover_label.pixmap()
+            src_px = self.cover_label.display_pixmap()
 
         hint = QLabel("ESC oder Doppelklick zum Schließen")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -14300,13 +18030,7 @@ window.addEventListener("unload", () => {
             self.cover_stack.removeWidget(self.video_frame)
         self.cover_stack.insertWidget(1, self.video_frame)
         self.cover_stack.setCurrentIndex(1)
-        # Fix: Kein hardcodiertes setFixedSize(248,248) — stattdessen flexible
-        # Size-Policy damit das Frame den Stack korrekt ausfüllt
-        self.video_frame.setMinimumSize(0, 0)
-        self.video_frame.setMaximumSize(16777215, 16777215)
-        self.video_frame.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
+        self._apply_cover_preview_size()
         self.video_frame.show()
         self.video_frame.mouseDoubleClickEvent = lambda e: self._open_video_fullscreen()
 
@@ -14358,6 +18082,7 @@ window.addEventListener("unload", () => {
         super().changeEvent(event)
         from PyQt6.QtCore import QEvent
         if event.type() in (QEvent.Type.ActivationChange, QEvent.Type.WindowStateChange):
+            self._update_lyrics_maximized_layout()
             # Tool-Window gehört zu Nova — wenn es Fokus hat, gilt das als aktiv
             vc = self._vid_controls
             if vc is not None:
@@ -14971,8 +18696,8 @@ window.addEventListener("unload", () => {
                     self.bb_song_title.setText(updated[1])
                     self.bb_song_artist.setText(f"{updated[2]}  ·  {updated[3]}")
                     if updated[5] and os.path.exists(updated[5]):
-                        px = QPixmap(updated[5]).scaled(240, 240, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                        self.cover_label.setPixmap(px)
+                        self.current_cover_path = updated[5]
+                        self.cover_label.set_cover_from_path(updated[5])
                         px_s = QPixmap(updated[5]).scaled(52, 52, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
                         self.bb_cover.setPixmap(px_s)
                     # Reload lyrics panel with new data
@@ -15132,20 +18857,215 @@ window.addEventListener("unload", () => {
 
     # ──────────────────────────── LYRICS ────────────────────────────
 
+    def _cover_outer_size(self):
+        if getattr(self, "_lyrics_expanded", False):
+            return getattr(self, "_COVER_OUTER_COMPACT", 168)
+        return getattr(self, "_COVER_OUTER_FULL", 248)
+
+    def _cover_inner_size(self):
+        return self._cover_outer_size() - getattr(self, "_COVER_INNER_MARGIN", 8)
+
+    def _apply_cover_preview_size(self, *, compact=None):
+        """Shrink or restore cover/video preview when lyrics panel toggles."""
+        if compact is None:
+            compact = getattr(self, "_lyrics_expanded", False)
+        if getattr(self, "_fs_win", None):
+            return
+
+        outer = self._COVER_OUTER_COMPACT if compact else self._COVER_OUTER_FULL
+        inner = outer - self._COVER_INNER_MARGIN
+
+        for widget in (
+            getattr(self, "cover_stack", None),
+            getattr(self, "_cover_container", None),
+            getattr(self, "video_frame", None),
+        ):
+            if widget is not None:
+                widget.setFixedSize(outer, outer)
+
+        if hasattr(self, "cover_label"):
+            self.cover_label.setFixedSize(inner, inner)
+            if not self.cover_label.has_cover() and self.cover_label.text() == "♫":
+                self.cover_label.show_placeholder("♫", 34 if compact else 48)
+            else:
+                self.cover_label.update()
+
+        if getattr(self, "is_video_mode", False) and self.cover_stack.currentIndex() == 1:
+            QTimer.singleShot(50, self._refresh_embedded_video_surface)
+
+        if hasattr(self, "cover_stack"):
+            self.cover_stack.updateGeometry()
+
+    def _apply_cover_preview_size_for_outer(self, outer: int):
+        """Apply an explicit animated outer size for the cover/video preview."""
+        if getattr(self, "_fs_win", None):
+            return
+
+        outer = int(outer)
+        if outer == getattr(self, "_cover_anim_last_outer", None):
+            return
+        self._cover_anim_last_outer = outer
+        inner = max(40, outer - self._COVER_INNER_MARGIN)
+
+        for widget in (
+            getattr(self, "cover_stack", None),
+            getattr(self, "_cover_container", None),
+            getattr(self, "video_frame", None),
+        ):
+            if widget is not None:
+                widget.setFixedSize(outer, outer)
+
+        if hasattr(self, "cover_label"):
+            self.cover_label.setFixedSize(inner, inner)
+            if not self.cover_label.has_cover() and self.cover_label.text() == "♫":
+                self.cover_label.show_placeholder(
+                    "♫", 34 if outer < self._COVER_OUTER_FULL else 48
+                )
+            else:
+                self.cover_label.update()
+
+    def _animate_lyrics_panel(self, expand: bool):
+        """Animate lyrics panel and cover preview together."""
+        layout = getattr(self, "_right_panel_layout", None)
+        if self._lyrics_anim_group is not None:
+            self._lyrics_anim_group.stop()
+            self._lyrics_anim_group = None
+        if self._cover_size_anim is not None:
+            self._cover_size_anim.stop()
+            self._cover_size_anim = None
+        if self._lyrics_opacity_anim is not None:
+            self._lyrics_opacity_anim.stop()
+            self._lyrics_opacity_anim = None
+        self._cover_anim_last_outer = None
+
+        start_h = max(0, self._lyrics_wrapper.maximumHeight())
+        target_h = (
+            self._lyrics_target_height_maximized
+            if self.isMaximized()
+            else self._lyrics_target_height
+        )
+        end_h = target_h if expand else 0
+        start_outer = self.cover_stack.width()
+        end_outer = self._COVER_OUTER_COMPACT if expand else self._COVER_OUTER_FULL
+
+        if expand:
+            self._lyrics_wrapper.setVisible(True)
+            self._lyrics_opacity.setOpacity(min(1.0, max(0.0, self._lyrics_opacity.opacity())))
+
+        height_anim = QPropertyAnimation(self._lyrics_wrapper, b"maximumHeight", self)
+        height_anim.setDuration(320)
+        height_anim.setStartValue(start_h)
+        height_anim.setEndValue(end_h)
+        if expand:
+            height_anim.setKeyValueAt(0.0, start_h)
+            height_anim.setKeyValueAt(0.45, int(end_h * 0.72))
+            height_anim.setKeyValueAt(0.78, int(end_h * 0.94))
+            height_anim.setKeyValueAt(1.0, end_h)
+            height_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        else:
+            height_anim.setKeyValueAt(0.0, start_h)
+            height_anim.setKeyValueAt(0.25, int(start_h * 0.92))
+            height_anim.setKeyValueAt(0.7, int(start_h * 0.32))
+            height_anim.setKeyValueAt(1.0, end_h)
+            height_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        cover_anim = QVariantAnimation(self)
+        cover_anim.setDuration(320)
+        cover_anim.setStartValue(start_outer)
+        cover_anim.setEndValue(end_outer)
+        if expand:
+            cover_anim.setKeyValueAt(0.0, start_outer)
+            cover_anim.setKeyValueAt(0.35, int(start_outer - (start_outer - end_outer) * 0.45))
+            cover_anim.setKeyValueAt(0.7, int(start_outer - (start_outer - end_outer) * 0.84))
+            cover_anim.setKeyValueAt(1.0, end_outer)
+            cover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        else:
+            cover_anim.setKeyValueAt(0.0, start_outer)
+            cover_anim.setKeyValueAt(0.3, int(start_outer + (end_outer - start_outer) * 0.18))
+            cover_anim.setKeyValueAt(0.72, int(start_outer + (end_outer - start_outer) * 0.82))
+            cover_anim.setKeyValueAt(1.0, end_outer)
+            cover_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        cover_anim.valueChanged.connect(lambda value: self._apply_cover_preview_size_for_outer(int(value)))
+
+        opacity_anim = QPropertyAnimation(self._lyrics_opacity, b"opacity", self)
+        opacity_anim.setDuration(250 if expand else 240)
+        opacity_anim.setStartValue(self._lyrics_opacity.opacity())
+        opacity_anim.setEndValue(1.0 if expand else 0.0)
+        if expand:
+            opacity_anim.setKeyValueAt(0.0, 0.0)
+            opacity_anim.setKeyValueAt(0.45, 0.0)
+            opacity_anim.setKeyValueAt(1.0, 1.0)
+            opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        else:
+            opacity_anim.setKeyValueAt(0.0, self._lyrics_opacity.opacity())
+            opacity_anim.setKeyValueAt(0.18, self._lyrics_opacity.opacity())
+            opacity_anim.setKeyValueAt(0.62, 0.35)
+            opacity_anim.setKeyValueAt(1.0, 0.0)
+            opacity_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(height_anim)
+        group.addAnimation(cover_anim)
+        group.addAnimation(opacity_anim)
+
+        def _finish():
+            self._cover_anim_last_outer = None
+            self._apply_cover_preview_size(compact=expand)
+            self._lyrics_wrapper.setMinimumHeight(0)
+            self._lyrics_opacity.setOpacity(1.0 if expand else 0.0)
+            if not expand:
+                self._lyrics_wrapper.setVisible(False)
+            parent = self._lyrics_wrapper.parentWidget()
+            if parent and parent.layout():
+                parent.layout().invalidate()
+                parent.layout().activate()
+            self._lyrics_anim_group = None
+            self._cover_size_anim = None
+            self._lyrics_opacity_anim = None
+
+        group.finished.connect(_finish)
+        self._lyrics_anim_group = group
+        self._cover_size_anim = cover_anim
+        self._lyrics_opacity_anim = opacity_anim
+        group.start()
+
+    def _refresh_embedded_video_surface(self):
+        """Re-bind VLC to the embedded video frame after a resize."""
+        if not getattr(self, "is_video_mode", False) or getattr(self, "_fs_win", None):
+            return
+        if self.cover_stack.currentIndex() != 1:
+            return
+        wid = int(self.video_frame.winId())
+        if sys.platform == "win32":
+            self.player.set_hwnd(wid)
+        elif sys.platform == "darwin":
+            self.player.set_nsobject(wid)
+        else:
+            self.player.set_xwindow(wid)
+
+    def _update_lyrics_maximized_layout(self):
+        """Adjust only the lyrics area in maximized mode."""
+        if not hasattr(self, "_lyrics_content"):
+            return
+        if self.isMaximized():
+            self._lyrics_content.setMargin(0)
+            if getattr(self, "_lyrics_expanded", False):
+                self._lyrics_wrapper.setMaximumHeight(self._lyrics_target_height_maximized)
+        else:
+            self._lyrics_content.setMargin(6)
+            if getattr(self, "_lyrics_expanded", False):
+                self._lyrics_wrapper.setMaximumHeight(self._lyrics_target_height)
+        self._lyrics_content.updateGeometry()
+
     def _toggle_lyrics_panel(self):
         """Collapse/expand the lyrics panel without shifting the cover/video above it."""
         self._lyrics_expanded = not self._lyrics_expanded
         if self._lyrics_expanded:
-            self._lyrics_wrapper.setMinimumHeight(120)
-            self._lyrics_wrapper.setMaximumHeight(280)
             self._lyrics_toggle_btn.setText("♪  Lyrics  ▴")
         else:
-            self._lyrics_wrapper.setMinimumHeight(0)
-            self._lyrics_wrapper.setMaximumHeight(0)
             self._lyrics_toggle_btn.setText("♪  Lyrics  ▾")
-        # Trigger a layout pass only on the wrapper, not the whole right column,
-        # so the cover_stack above is not repositioned.
         self._lyrics_wrapper.updateGeometry()
+        self._animate_lyrics_panel(self._lyrics_expanded)
 
     def _load_lyrics(self, artist: str, title: str, song_id=None, video_id=None):
         """Load lyrics: memory cache first, then DB, then API fallback."""
@@ -15162,15 +19082,9 @@ window.addEventListener("unload", () => {
         self._lyrics_song_id  = song_id
         self._lyrics_video_id = video_id
 
-        # ── 0. Check in-memory cache ─────────────────────────────────────────
+        # ── 0. Check DB for manually saved lyrics first ─────────────────────
         cache_key = (artist.lower().strip(), title.lower().strip())
         self._lyrics_current_key = cache_key
-        if cache_key in self._lyrics_cache:
-            cached = self._lyrics_cache[cache_key]
-            self._on_lyrics_ready("\n".join(cached), cached)
-            return
-
-        # ── 1. Check DB for manually saved lyrics ────────────────────────
         db_lyrics = None
         if song_id:
             row = self.db.cursor.execute("SELECT lyrics FROM songs WHERE id=?", (song_id,)).fetchone()
@@ -15180,10 +19094,18 @@ window.addEventListener("unload", () => {
             db_lyrics = (row[0] or "").strip() if row else ""
 
         if db_lyrics:
-            lines = db_lyrics.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            cleaned = LyricsFetcher.sanitize_lyrics_text(db_lyrics)
+            lines = cleaned.split("\n") if cleaned else []
             # Also populate in-memory cache so subsequent switches don't re-query the DB
-            self._lyrics_cache[cache_key] = list(lines)
-            self._on_lyrics_ready(db_lyrics, lines)
+            if lines:
+                self._lyrics_cache[cache_key] = list(lines)
+                self._on_lyrics_ready(cleaned, lines)
+                return
+
+        # ── 1. Check compressed on-disk cache ──────────────────────────────
+        if cache_key in self._lyrics_cache:
+            cached = self._lyrics_cache[cache_key]
+            self._on_lyrics_ready("\n".join(cached), cached)
             return
 
         # ── 2. API fallback ───────────────────────────────────────────────
@@ -15210,7 +19132,7 @@ window.addEventListener("unload", () => {
         fetcher.start()
 
     def _on_lyrics_ready(self, _raw: str, lines: list):
-        """Store lines, populate cache, auto-save to DB, and build timestamp estimates."""
+        """Store lines, populate cache, and build timestamp estimates."""
         self._lyrics_lines        = lines
         self._lyrics_current_line = -1
         has_lines = bool(lines)
@@ -15221,35 +19143,7 @@ window.addEventListener("unload", () => {
         # Populate in-memory cache so switching back to this song is instant
         if has_lines and self._lyrics_current_key:
             self._lyrics_cache[self._lyrics_current_key] = list(lines)
-
-        # ── Auto-save freshly fetched lyrics to DB so they survive restarts ──
-        # Only write when the lyrics came from the API (not from DB itself),
-        # i.e. when the DB entry was still empty. We detect this by checking
-        # whether _lyrics_song_id / _lyrics_video_id is set.
-        if has_lines:
-            raw = "\n".join(lines)
-            try:
-                if self._lyrics_song_id:
-                    # Only write if the DB row is still empty (don't overwrite manual edits)
-                    existing = self.db.cursor.execute(
-                        "SELECT lyrics FROM songs WHERE id=?", (self._lyrics_song_id,)
-                    ).fetchone()
-                    if existing and not (existing[0] or "").strip():
-                        self.db.cursor.execute(
-                            "UPDATE songs SET lyrics=? WHERE id=?", (raw, self._lyrics_song_id)
-                        )
-                        self.db.conn.commit()
-                elif self._lyrics_video_id:
-                    existing = self.db.cursor.execute(
-                        "SELECT lyrics FROM videos WHERE id=?", (self._lyrics_video_id,)
-                    ).fetchone()
-                    if existing and not (existing[0] or "").strip():
-                        self.db.cursor.execute(
-                            "UPDATE videos SET lyrics=? WHERE id=?", (raw, self._lyrics_video_id)
-                        )
-                        self.db.conn.commit()
-            except Exception:
-                pass  # DB write failure is non-critical
+            _save_lyrics_disk_cache(self._lyrics_cache)
 
         # We don't have real word-level timestamps, so distribute lines
         # evenly over the song duration. Once we know the length we update.
@@ -15295,6 +19189,9 @@ window.addEventListener("unload", () => {
         if not self._lyrics_lines:
             return
         raw = "\n".join(self._lyrics_lines)
+        if self._lyrics_current_key:
+            self._lyrics_cache[self._lyrics_current_key] = list(self._lyrics_lines)
+            _save_lyrics_disk_cache(self._lyrics_cache)
         if self.current_song_id and not self.is_video_mode:
             self.db.cursor.execute("UPDATE songs SET lyrics=? WHERE id=?", (raw, self.current_song_id))
             self.db.conn.commit()
@@ -15401,6 +19298,9 @@ window.addEventListener("unload", () => {
                         )
             else:
                 self._discord.disable()
+            self._start_global_media_keys()
+            if hasattr(self, "extras_panel"):
+                self.extras_panel.refresh_ai_features_visibility()
 
     def closeEvent(self, event):
         """Clean shutdown: save position, release VLC/browser/Discord resources."""
@@ -15422,6 +19322,14 @@ window.addEventListener("unload", () => {
                 self.yt_browser.shutdown()
             except Exception:
                 pass
+        if getattr(self, "extras_panel", None):
+            try:
+                self.extras_panel.html_viewer_view.exit_fullscreen_if_open()
+                self.extras_panel.html_viewer_view.stop_agent_if_running()
+                self.extras_panel.ai_chat_view.shutdown()
+            except Exception:
+                pass
+        self._stop_global_media_keys()
         if getattr(self, "_ext_server", None):
             self._ext_server.stop()
         self._discord.disconnect()
