@@ -97,6 +97,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QScrollArea,
     QTextEdit,
+    QPlainTextEdit,
     QGroupBox,
     QToolButton,
     QSplitter,
@@ -255,6 +256,79 @@ def _llama_cpp_install_hint(use_gpu=False):
     )
 
 
+def _gemma_models_folder():
+    return _NOVA_MODELS_DIR
+
+
+def _gemma_file_status(path):
+    """Human-readable file status for setup terminal (any PC)."""
+    if os.path.isfile(path):
+        mb = os.path.getsize(path) / (1024 * 1024)
+        return f"OK — {mb:.0f} MB"
+    part = path + ".part"
+    if os.path.isfile(part):
+        mb = os.path.getsize(part) / (1024 * 1024)
+        return f"downloading… {mb:.0f} MB so far"
+    return "not downloaded yet"
+
+
+def _gemma_setup_status_snapshot():
+    """Live status lines — paths resolve on this machine at runtime."""
+    gpu = _nvidia_gpu_name() if _nvidia_gpu_detected() else None
+    engine = "ready" if _LLAMA_CPP_AVAILABLE else "not installed"
+    if _LLAMA_CPP_AVAILABLE and _Gemma4ChatHandler is None:
+        engine = "installed but outdated (re-run Auto-Setup)"
+    lines = [
+        f"Python:      {sys.executable}",
+        f"Nova folder: {os.path.dirname(os.path.abspath(__file__))}",
+        f"Models folder: {_NOVA_MODELS_DIR}",
+        f"Engine (llama-cpp): {engine}",
+        f"GPU:         {gpu or 'none / CPU mode'}",
+        f"Model:       {_gemma_file_status(_GEMMA_MODEL_PATH)}",
+        f"             {_GEMMA_MODEL_FILENAME} ({_GEMMA_MODEL_SIZE_HINT})",
+        f"Projector:   {_gemma_file_status(_GEMMA_MMPROJ_PATH)}",
+        f"             {_GEMMA_MMPROJ_FILENAME} ({_GEMMA_MMPROJ_SIZE_HINT})",
+    ]
+    if _gemma_setup_needed():
+        lines.append("Next step: click ⬇ Auto-Setup (or use the 2 manual commands in ℹ Info)")
+    elif _LLAMA_CPP_AVAILABLE:
+        lines.append("Next step: click Load model (or Auto-Setup already finished)")
+    return lines
+
+
+def _gemma_setup_cmd_instructions():
+    """Short manual fallback — 2 commands, paths filled for THIS PC."""
+    py = sys.executable
+    nova = os.path.dirname(os.path.abspath(__file__))
+    pip_cmd = (
+        f'"{py}" -m pip install llama-cpp-python huggingface_hub '
+        f'--prefer-binary --upgrade '
+        f'--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu'
+    )
+    dl_inner = (
+        "from huggingface_hub import hf_hub_download; import os; "
+        f"d=os.path.join(r'{nova}', '.nova_models'); os.makedirs(d, exist_ok=True); "
+        "repo='lmstudio-community/gemma-4-E2B-it-GGUF'; "
+        f"files=('{_GEMMA_MODEL_FILENAME}', '{_GEMMA_MMPROJ_FILENAME}'); "
+        "[hf_hub_download(repo_id=repo, filename=x, local_dir=d) for x in files]"
+    )
+    dl_cmd = f'"{py}" -c "{dl_inner}"'
+    snap = "\n".join(_gemma_setup_status_snapshot())
+    return (
+        "Gemma 4 E2B — manual fallback\n"
+        "============================\n\n"
+        "Recommended: ⬇ Auto-Setup in Nova AI Chat (one click, no CMD).\n\n"
+        "Only if Auto-Setup fails — open cmd.exe and run these 2 commands:\n\n"
+        f'cd /d "{nova}"\n'
+        f"{pip_cmd}\n"
+        f"{dl_cmd}\n\n"
+        "Then restart Nova → ⚙ → Load model.\n\n"
+        "Optional GPU (NVIDIA + CUDA 12): use ⚡ Enable GPU in settings after CPU works.\n"
+        "DLL error? Install VC++ x64: https://aka.ms/vs/17/release/vc_redist.x64.exe\n\n"
+        f"--- Status on this PC ---\n{snap}"
+    )
+
+
 def _llama_cpp_unavailable_hint(use_gpu=False):
     """User-facing message when llama_cpp import/DLL load failed."""
     lines = [
@@ -352,7 +426,9 @@ _LLAMA_GPU_WHEEL_URL = (
 )
 
 
-def _pip_install_llama_cpp(use_gpu=False):
+def _pip_install_llama_cpp(use_gpu=False, progress_cb=None):
+    if progress_cb:
+        progress_cb(0, "Installing llama-cpp-python… (1–3 min, bitte warten)")
     if use_gpu and os.name == "nt" and _nvidia_gpu_detected():
         cmd = [
             sys.executable, "-m", "pip", "install", _LLAMA_GPU_WHEEL_URL,
@@ -373,6 +449,8 @@ def _pip_install_llama_cpp(use_gpu=False):
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "pip install failed").strip()
         raise RuntimeError(err[-1200:])
+    if progress_cb:
+        progress_cb(50, "Verifying llama-cpp-python…")
     if not _reload_llama_cpp():
         raise RuntimeError(_llama_cpp_unavailable_hint(use_gpu))
     if use_gpu and not _llama_gpu_offload_available():
@@ -380,6 +458,160 @@ def _pip_install_llama_cpp(use_gpu=False):
             "GPU wheel installed but CUDA offload is still unavailable. "
             "Install NVIDIA CUDA Toolkit 12.x from developer.nvidia.com, then retry."
         )
+    if progress_cb:
+        progress_cb(100, "llama-cpp-python installed.")
+
+
+def _gemma_setup_needed():
+    """True when pip engine and/or model files are missing."""
+    return (
+        not _LLAMA_CPP_AVAILABLE
+        or _Gemma4ChatHandler is None
+        or not os.path.isfile(_GEMMA_MODEL_PATH)
+        or not os.path.isfile(_GEMMA_MMPROJ_PATH)
+    )
+
+
+def _curl_executable():
+    for cand in (
+        shutil.which("curl.exe"),
+        shutil.which("curl"),
+        r"C:\Windows\System32\curl.exe",
+    ):
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _download_via_urllib(url, dest_path, label, progress_cb, stop_check):
+    import time
+    tmp_path = dest_path + ".part"
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NovaX7/1.0",
+            "Accept": "*/*",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        chunk_size = 1024 * 512
+        with open(tmp_path, "wb") as out:
+            while True:
+                if stop_check():
+                    raise InterruptedError("Setup cancelled")
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if total > 0:
+                    pct = min(100, int(done * 100 / total))
+                    mb_done = done / (1024 * 1024)
+                    mb_total = total / (1024 * 1024)
+                    progress_cb(
+                        pct,
+                        f"{label}: {mb_done:.0f} / {mb_total:.0f} MB ({pct}%)",
+                    )
+                else:
+                    mb_done = done / (1024 * 1024)
+                    progress_cb(0, f"{label}: {mb_done:.0f} MB…")
+    os.replace(tmp_path, dest_path)
+
+
+def _download_via_curl(url, dest_path, label, progress_cb, stop_check):
+    import time
+    curl = _curl_executable()
+    if not curl:
+        raise RuntimeError("curl.exe not found")
+    tmp_path = dest_path + ".part"
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    proc = subprocess.Popen(
+        [curl, "-L", "--retry", "3", "--retry-delay", "5", "-o", tmp_path, url],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    while proc.poll() is None:
+        if stop_check():
+            proc.kill()
+            raise InterruptedError("Setup cancelled")
+        if os.path.isfile(tmp_path):
+            mb = os.path.getsize(tmp_path) / (1024 * 1024)
+            progress_cb(0, f"{label}: {mb:.0f} MB (curl)…")
+        time.sleep(0.8)
+    err = (proc.stderr.read() or b"").decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        raise RuntimeError(err[-400:] or f"curl exit {proc.returncode}")
+    if not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) < 1024:
+        raise RuntimeError("curl download empty or too small")
+    os.replace(tmp_path, dest_path)
+
+
+def _ensure_huggingface_hub():
+    try:
+        import huggingface_hub  # noqa: F401
+        return
+    except ImportError:
+        pass
+    proc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-U", "huggingface_hub"],
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "huggingface_hub install failed")[-800:])
+
+
+def _download_via_huggingface(filename, dest_path, label, progress_cb, stop_check):
+    if stop_check():
+        raise InterruptedError("Setup cancelled")
+    progress_cb(0, f"{label}: Hugging Face download…")
+    _ensure_huggingface_hub()
+    from huggingface_hub import hf_hub_download
+    local_dir = os.path.dirname(dest_path)
+    hf_hub_download(
+        repo_id="lmstudio-community/gemma-4-E2B-it-GGUF",
+        filename=filename,
+        local_dir=local_dir,
+        local_dir_use_symlinks=False,
+    )
+    got = os.path.join(local_dir, filename)
+    if not os.path.isfile(got):
+        raise RuntimeError(f"Hugging Face: {filename} not found after download")
+    if os.path.abspath(got) != os.path.abspath(dest_path):
+        if os.path.isfile(dest_path):
+            os.remove(dest_path)
+        os.replace(got, dest_path)
+
+
+def _download_gemma_file(url, dest_path, label, progress_cb, stop_check):
+    """urllib → curl.exe → huggingface_hub."""
+    filename = os.path.basename(dest_path)
+    errors = []
+    for method, fn in (
+        ("direct", lambda: _download_via_urllib(url, dest_path, label, progress_cb, stop_check)),
+        ("curl", lambda: _download_via_curl(url, dest_path, label, progress_cb, stop_check)),
+        ("huggingface", lambda: _download_via_huggingface(
+            filename, dest_path, label, progress_cb, stop_check)),
+    ):
+        try:
+            fn()
+            return
+        except InterruptedError:
+            raise
+        except Exception as e:
+            errors.append(f"{method}: {e}")
+            try:
+                tmp = dest_path + ".part"
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+    raise RuntimeError("All download methods failed — " + " | ".join(errors[:3]))
 
 
 def _ai_gpu_usable():
@@ -7887,8 +8119,14 @@ class _GemmaModelDownloadThread(QThread):
         tmp_path = self.dest_path + ".part"
         try:
             os.makedirs(os.path.dirname(self.dest_path), exist_ok=True)
-            req = urllib.request.Request(self.url, headers={"User-Agent": "NovaX7/1.0"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            req = urllib.request.Request(
+                self.url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NovaX7/1.0",
+                    "Accept": "*/*",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 chunk_size = 1024 * 256
@@ -7944,92 +8182,97 @@ class _LlamaGpuInstallThread(QThread):
 
 
 class _NovaAiSetupThread(QThread):
-    """Install llama-cpp-python if needed, then download model + mmproj."""
+    """One-click: pip install llama-cpp + download model + mmproj."""
     progress = pyqtSignal(int, str)
+    log_line = pyqtSignal(str)
     finished_ok = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, install_llama, use_gpu):
+    def __init__(self, use_gpu, auto_load=False):
         super().__init__()
-        self.install_llama = install_llama
         self.use_gpu = use_gpu
+        self.auto_load = auto_load
         self._stop = False
 
     def stop(self):
         self._stop = True
 
-    @staticmethod
-    def _download_file(url, dest_path, label, progress_cb, stop_check):
-        tmp_path = dest_path + ".part"
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            done = 0
-            chunk_size = 1024 * 256
-            with open(tmp_path, "wb") as out:
-                while True:
-                    if stop_check():
-                        raise InterruptedError("Setup cancelled")
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    done += len(chunk)
-                    if total > 0:
-                        pct = min(100, int(done * 100 / total))
-                        mb_done = done / (1024 * 1024)
-                        mb_total = total / (1024 * 1024)
-                        progress_cb(
-                            pct,
-                            f"Downloading {label}… {mb_done:.0f} / {mb_total:.0f} MB ({pct}%)",
-                        )
-                    else:
-                        mb_done = done / (1024 * 1024)
-                        progress_cb(0, f"Downloading {label}… {mb_done:.0f} MB")
-        os.replace(tmp_path, dest_path)
+    def _emit(self, pct, msg):
+        self.progress.emit(max(0, min(100, int(pct))), msg)
+        if msg:
+            self.log_line.emit(msg)
 
     def run(self):
         try:
-            if self.install_llama:
-                self.progress.emit(0, "Installing llama-cpp-python…")
-                _pip_install_llama_cpp(use_gpu=self.use_gpu)
+            os.makedirs(_NOVA_MODELS_DIR, exist_ok=True)
+            self.log_line.emit(f"Models folder: {_NOVA_MODELS_DIR}")
+            steps = []
+
+            need_pip = (
+                not _LLAMA_CPP_AVAILABLE
+                or _Gemma4ChatHandler is None
+            )
+            if need_pip:
+                steps.append("pip")
+            if not os.path.isfile(_GEMMA_MODEL_PATH):
+                steps.append("model")
+            if not os.path.isfile(_GEMMA_MMPROJ_PATH):
+                steps.append("mmproj")
+
+            if not steps:
+                self._emit(100, "Already set up.")
+                self.log_line.emit("Nothing to download — files already present.")
+                self.finished_ok.emit()
+                return
+
+            n = len(steps)
+            idx = 0
+
+            if "pip" in steps:
+                self._emit(int(idx * 100 / n), f"Step {idx + 1}/{n}: Installing engine…")
+                self.log_line.emit("Installing llama-cpp-python via pip…")
+
+                def pip_prog(sub_pct, msg):
+                    span = 100 / n
+                    self._emit(int(idx * 100 / n + sub_pct * span / 100), msg)
+
+                _pip_install_llama_cpp(use_gpu=self.use_gpu, progress_cb=pip_prog)
+                self.log_line.emit("llama-cpp-python installed.")
+                idx += 1
 
             downloads = []
-            if not os.path.isfile(_GEMMA_MODEL_PATH):
+            if "model" in steps:
                 downloads.append(
                     (_GEMMA_MODEL_URL, _GEMMA_MODEL_PATH, f"{_GEMMA_MODEL_LABEL} model")
                 )
-            if not os.path.isfile(_GEMMA_MMPROJ_PATH):
+            if "mmproj" in steps:
                 downloads.append(
                     (_GEMMA_MMPROJ_URL, _GEMMA_MMPROJ_PATH, "vision/audio projector")
                 )
 
-            for i, (url, path, label) in enumerate(downloads):
+            for j, (url, path, label) in enumerate(downloads):
                 if self._stop:
                     raise InterruptedError("Setup cancelled")
+                step_no = idx + j + 1
+                self.log_line.emit(f"Downloading {label} ({step_no}/{n})…")
+                self._emit(
+                    int((idx + j) * 100 / n),
+                    f"Step {step_no}/{n}: {label}…",
+                )
 
-                def _progress(pct, msg, base=i, total=len(downloads)):
-                    overall = int((base * 100 + pct) / max(1, total))
-                    self.progress.emit(overall, msg)
+                def dl_prog(sub_pct, msg, base=idx + j):
+                    span = 100 / n
+                    self._emit(int(base * span + sub_pct * span / 100), msg)
 
-                try:
-                    self._download_file(
-                        url, path, label, _progress, lambda: self._stop
-                    )
-                except Exception as e:
-                    try:
-                        tmp = path + ".part"
-                        if os.path.exists(tmp):
-                            os.remove(tmp)
-                    except OSError:
-                        pass
-                    raise
+                _download_gemma_file(url, path, label, dl_prog, lambda: self._stop)
+                self.log_line.emit(f"Finished: {label}")
 
-            self.progress.emit(100, "Setup complete.")
+            self._emit(100, "Setup complete.")
+            self.log_line.emit("Auto-setup complete — loading model…")
             self.finished_ok.emit()
         except Exception as e:
             if not self._stop:
+                self.log_line.emit(f"ERROR: {e}")
                 self.failed.emit(str(e))
 
 
@@ -8121,9 +8364,36 @@ class NovaAiChatPanel(QWidget):
         self._pending_images = []
         self._pending_audio = []
         self._settings = _load_ai_chat_settings()
+        self._setup_log_lines = []
+        self._setup_poll_timer = QTimer(self)
+        self._setup_poll_timer.setInterval(2000)
+        self._setup_poll_timer.timeout.connect(self._render_setup_terminal)
         self._build_ui()
         self.apply_theme_styles()
         self.refresh_status()
+        self._render_setup_terminal()
+
+    def _log_setup(self, msg, ts=True):
+        from datetime import datetime
+        line = msg if not ts else f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        self._setup_log_lines.append(line)
+        if len(self._setup_log_lines) > 200:
+            self._setup_log_lines = self._setup_log_lines[-200:]
+        self._render_setup_terminal()
+
+    def _clear_setup_log(self):
+        self._setup_log_lines.clear()
+        self._render_setup_terminal()
+
+    def _render_setup_terminal(self):
+        if not hasattr(self, "setup_terminal"):
+            return
+        log = "\n".join(self._setup_log_lines[-80:]) if self._setup_log_lines else "(no log yet)"
+        snap = "\n".join(_gemma_setup_status_snapshot())
+        text = f"── Log ──\n{log}\n\n── File status (this PC) ──\n{snap}"
+        self.setup_terminal.setPlainText(text)
+        sb = self.setup_terminal.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _theme(self):
         p = self.extras_panel.parent_player
@@ -8265,15 +8535,27 @@ class NovaAiChatPanel(QWidget):
             f"QPushButton:disabled {{ color: {t['border']}; }}"
         )
         for btn in (
-            self.settings_btn, self.new_chat_btn,
+            self.settings_btn, self.new_chat_btn, self.setup_info_btn,
             self.attach_img_btn, self.attach_aud_btn, self.clear_attach_btn,
         ):
             btn.setStyleSheet(icon_ss)
         for btn in (
             self.download_btn, self.load_btn, self.unload_btn,
-            self.clear_btn, self.gpu_install_btn,
+            self.clear_btn, self.gpu_install_btn, self.cmd_info_btn,
+            self.setup_term_refresh_btn, self.setup_term_clear_btn,
         ):
             btn.setStyleSheet(ghost_ss)
+
+        t = self._theme()
+        g = self._glass()
+        self.setup_terminal.setStyleSheet(
+            f"QPlainTextEdit {{"
+            f"  background: {g['input']}; color: {t['text']};"
+            f"  border: 1px solid {g['border']}; border-radius: 8px;"
+            f"  padding: 8px; font-family: Consolas, 'Courier New', monospace;"
+            f"  font-size: 9pt;"
+            f"}}"
+        )
 
         self._style_send_btn(streaming=self._streaming_reply)
 
@@ -8407,12 +8689,18 @@ class NovaAiChatPanel(QWidget):
         self.settings_btn.setCheckable(True)
         self.settings_btn.toggled.connect(self._toggle_settings_panel)
 
+        self.setup_info_btn = QPushButton("ℹ")
+        self.setup_info_btn.setFixedSize(32, 32)
+        self.setup_info_btn.setToolTip("Manual fallback: 2 CMD commands (paths for this PC)")
+        self.setup_info_btn.clicked.connect(self._show_gemma_setup_info)
+
         hb.addWidget(self._avatar_lbl)
         hb.addWidget(self._title_lbl)
         hb.addStretch()
         hb.addWidget(self.status_pill)
         hb.addSpacing(6)
         hb.addWidget(self.new_chat_btn)
+        hb.addWidget(self.setup_info_btn)
         hb.addWidget(self.settings_btn)
         layout.addWidget(self.header)
 
@@ -8476,13 +8764,21 @@ class NovaAiChatPanel(QWidget):
         self.unload_btn = QPushButton("Unload")
         self.unload_btn.setFixedHeight(30)
         self.unload_btn.clicked.connect(self._unload_model)
-        self.download_btn = QPushButton(f"⬇  Download {_GEMMA_MODEL_LABEL}")
+        self.download_btn = QPushButton(f"⬇  Auto-Setup {_GEMMA_MODEL_LABEL}")
+        self.download_btn.setToolTip(
+            "Installiert llama-cpp-python, lädt Modell + Projector (~4,4 GB) "
+            "und lädt das Modell automatisch — alles in einem Klick."
+        )
         self.download_btn.clicked.connect(self._start_download)
+        self.cmd_info_btn = QPushButton("ℹ  Manual (2 cmds)")
+        self.cmd_info_btn.setToolTip("Only if Auto-Setup fails — 2 universal CMD commands")
+        self.cmd_info_btn.clicked.connect(self._show_gemma_setup_info)
         self.clear_btn = QPushButton("Clear chat")
         self.clear_btn.clicked.connect(self._clear_chat)
         model_row.addWidget(self.load_btn)
         model_row.addWidget(self.unload_btn)
         model_row.addWidget(self.download_btn)
+        model_row.addWidget(self.cmd_info_btn)
         model_row.addWidget(self.clear_btn)
         model_row.addStretch()
         sp.addLayout(model_row)
@@ -8505,6 +8801,36 @@ class NovaAiChatPanel(QWidget):
         self.progress.setVisible(False)
         self.progress.setFixedHeight(6)
         sp.addWidget(self.progress)
+
+        self.setup_status_lbl = QLabel("")
+        self.setup_status_lbl.setWordWrap(True)
+        self.setup_status_lbl.hide()
+        sp.addWidget(self.setup_status_lbl)
+
+        term_hdr = QHBoxLayout()
+        term_hdr.addWidget(QLabel("Setup terminal"))
+        term_hdr.addStretch()
+        self.setup_term_refresh_btn = QPushButton("↻ Refresh")
+        self.setup_term_refresh_btn.setFixedHeight(26)
+        self.setup_term_refresh_btn.clicked.connect(self._render_setup_terminal)
+        self.setup_term_clear_btn = QPushButton("Clear log")
+        self.setup_term_clear_btn.setFixedHeight(26)
+        self.setup_term_clear_btn.clicked.connect(self._clear_setup_log)
+        term_hdr.addWidget(self.setup_term_refresh_btn)
+        term_hdr.addWidget(self.setup_term_clear_btn)
+        sp.addLayout(term_hdr)
+
+        self.setup_terminal = QPlainTextEdit()
+        self.setup_terminal.setReadOnly(True)
+        self.setup_terminal.setObjectName("ai_setup_terminal")
+        self.setup_terminal.setFont(QFont("Consolas", 9))
+        self.setup_terminal.setMinimumHeight(100)
+        self.setup_terminal.setMaximumHeight(170)
+        self.setup_terminal.setPlaceholderText(
+            "Live download log + file sizes. Open ⚙ settings to watch progress."
+        )
+        sp.addWidget(self.setup_terminal)
+
         layout.addWidget(self.settings_panel)
 
         # ── Body: stacked widget (welcome page | chat log) ─────────────────────
@@ -8734,6 +9060,8 @@ class NovaAiChatPanel(QWidget):
 
     def _toggle_settings_panel(self, visible):
         self.settings_panel.setVisible(visible)
+        if visible:
+            self._render_setup_terminal()
 
     def _current_settings(self):
         return {
@@ -8929,7 +9257,12 @@ class NovaAiChatPanel(QWidget):
             )
 
         busy = self._setup_thread is not None and self._setup_thread.isRunning()
-        self.download_btn.setEnabled(not models_ready and not busy)
+        need_setup = _gemma_setup_needed()
+        self.download_btn.setEnabled(need_setup and not busy)
+        self.download_btn.setText(
+            f"⬇  Auto-Setup {_GEMMA_MODEL_LABEL}" if need_setup
+            else f"✓ {_GEMMA_MODEL_LABEL} installed"
+        )
         self.load_btn.setEnabled(models_ready and self._llm is None and not busy)
         self.load_btn.setVisible(self._llm is None)
         self.unload_btn.setEnabled(self._llm is not None and not self._streaming_reply)
@@ -8945,29 +9278,41 @@ class NovaAiChatPanel(QWidget):
             self._render_empty_state()
 
     def _start_download(self):
-        if self._models_ready():
-            return
         if self._setup_thread and self._setup_thread.isRunning():
+            return
+        if not _gemma_setup_needed():
+            if self._llm is None and _LLAMA_CPP_AVAILABLE and self._models_ready():
+                self._load_model()
             return
         self.progress.setVisible(True)
         self.progress.setValue(0)
+        self.setup_status_lbl.setText("Starting auto-setup…")
+        self.setup_status_lbl.show()
         self.download_btn.setEnabled(False)
-        install_llama = not _LLAMA_CPP_AVAILABLE
-        self._setup_thread = _NovaAiSetupThread(install_llama, self._use_gpu())
+        if not self.settings_panel.isVisible():
+            self.settings_btn.setChecked(True)
+            self.settings_panel.setVisible(True)
+        self._log_setup("Auto-setup started — watch progress below.")
+        self._setup_poll_timer.start()
+        self._setup_thread = _NovaAiSetupThread(self._use_gpu(), auto_load=True)
         self._setup_thread.progress.connect(self._on_setup_progress)
+        self._setup_thread.log_line.connect(self._log_setup)
         self._setup_thread.finished_ok.connect(self._on_setup_ok)
         self._setup_thread.failed.connect(self._on_setup_failed)
         self._setup_thread.start()
 
     def _on_setup_progress(self, pct, msg):
-        if pct > 0:
-            self.progress.setValue(pct)
+        self.progress.setValue(max(0, min(100, pct)))
         self.progress.setVisible(True)
+        if msg:
+            self.setup_status_lbl.setText(msg)
+            self.setup_status_lbl.show()
         if not self.settings_panel.isVisible():
             self.settings_btn.setChecked(True)
             self.settings_panel.setVisible(True)
         t = self._theme()
-        self.status_pill.setText("● Downloading…")
+        short = msg if len(msg) <= 48 else msg[:45] + "…"
+        self.status_pill.setText(f"● {short}")
         self.status_pill.setStyleSheet(
             f"color: {t['accent2']}; font-size: 11px; padding: 4px 10px; "
             f"background: {t['highlight']}; border-radius: 12px;"
@@ -8975,13 +9320,20 @@ class NovaAiChatPanel(QWidget):
 
     def _on_setup_ok(self):
         self._setup_thread = None
+        self._setup_poll_timer.stop()
         self.progress.setVisible(False)
+        self.setup_status_lbl.hide()
+        self._log_setup("Setup complete — loading model…")
         self.refresh_status()
-        self._append_system("Gemma 4 setup complete (llama-cpp-python + model + projector).")
+        QTimer.singleShot(200, self._load_model)
 
     def _on_setup_failed(self, err):
         self._setup_thread = None
+        self._setup_poll_timer.stop()
         self.progress.setVisible(False)
+        self.setup_status_lbl.setText(f"Failed: {err}")
+        self.setup_status_lbl.show()
+        self._log_setup(f"Setup failed: {err}")
         t = self._theme()
         self.status_pill.setText("● Setup failed")
         self.status_pill.setStyleSheet(
@@ -8989,7 +9341,41 @@ class NovaAiChatPanel(QWidget):
             f"background: {t['highlight']}; border-radius: 12px;"
         )
         self._append_system(f"Setup failed: {err}")
+        self._append_system("See Setup terminal below, or ℹ Manual (2 cmds).")
         self.refresh_status()
+
+    def _show_gemma_setup_info(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Gemma 4 — Manual fallback")
+        dlg.setMinimumSize(680, 480)
+        lay = QVBoxLayout(dlg)
+        intro = QLabel(
+            "<b>Use ⬇ Auto-Setup first</b> — it does everything automatically.<br>"
+            "This dialog is only a backup: <b>2 commands</b> with paths already filled "
+            "for <b>this PC</b>. Live status is in the Setup terminal (⚙ settings)."
+        )
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(_gemma_setup_cmd_instructions())
+        text.setFont(QFont("Consolas", 10))
+        lay.addWidget(text, 1)
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("📋  Alles kopieren")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(text.toPlainText()))
+        open_cmd_btn = QPushButton("📂  Modell-Ordner öffnen")
+        open_cmd_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(_gemma_models_folder()))
+        )
+        close_btn = QPushButton("Schließen")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(open_cmd_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+        dlg.exec()
 
     def _load_model(self):
         if not _LLAMA_CPP_AVAILABLE:
