@@ -1,4 +1,4 @@
-# Version: 7.1.8
+# Version: 7.1.9
 import sys as _sys
 import os as _os
 
@@ -76,6 +76,8 @@ import hmac
 import secrets
 import struct
 import tempfile
+import importlib.util
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -121,8 +123,9 @@ from PyQt6.QtWidgets import (
     QTextBrowser,
     QScroller,
     QScrollerProperties,
+    QFileIconProvider,
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal, QPoint, QPointF, QUrl, QMimeData, QRect, QRectF, QElapsedTimer, QEasingCurve, QPropertyAnimation, QParallelAnimationGroup, QVariantAnimation
+from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal, QPoint, QPointF, QUrl, QMimeData, QRect, QRectF, QElapsedTimer, QEasingCurve, QPropertyAnimation, QParallelAnimationGroup, QVariantAnimation, QFileInfo
 from PyQt6.QtGui import QFont, QPixmap, QAction, QIcon, QColor, QPalette, QKeySequence, QShortcut, QBrush, QPen, QDesktopServices, QPainter
 
 # Optional: PyQtWebEngine for the YouTube browser panel
@@ -1623,11 +1626,611 @@ def _save_nova_chat_sessions(active_id, order, chats):
 
 
 EXTRAS_AI_FEATURES_DB_KEY = "extras_show_ai_features"
+# Legacy keys (migration)
+PY_LAUNCHER_ENABLED_KEY = "py_launcher_enabled"
+PY_LAUNCHER_SCAN_PATHS_KEY = "py_launcher_scan_paths"
+PY_LAUNCHER_TOOLS_PATHS_KEY = "py_launcher_tools_paths"
+# Emulator-Bibliothek
+EMU_LIBRARY_ENABLED_KEY = "emu_library_enabled"
+EMU_LIBRARY_SCAN_PATHS_KEY = "emu_library_scan_paths"
+EMU_LIBRARY_HISTORY_KEY = "emu_library_history"
+EMU_LIBRARY_CACHE_KEY = "emu_library_cache"
+EMU_LIBRARY_MANUAL_KEY = "emu_library_manual"
+EMU_LIBRARY_HIDDEN_KEY = "emu_library_hidden"
+# PY-Tools-Bibliothek
+PY_TOOLS_LIBRARY_ENABLED_KEY = "py_tools_library_enabled"
+PY_TOOLS_LIBRARY_SCAN_PATHS_KEY = "py_tools_library_scan_paths"
+PY_TOOLS_LIBRARY_HISTORY_KEY = "py_tools_library_history"
+PY_TOOLS_LIBRARY_CACHE_KEY = "py_tools_library_cache"
+PY_TOOLS_LIBRARY_MANUAL_KEY = "py_tools_library_manual"
+PY_TOOLS_LIBRARY_HIDDEN_KEY = "py_tools_library_hidden"
+_LAUNCHER_SETTINGS_MIGRATED_KEY = "_launcher_settings_migrated_v3"
+
+
+def _write_launcher_enabled_settings(db, emu_on, py_on):
+    """Persist launcher library toggles (Emulator + PY) and legacy combined key."""
+    if not db:
+        return
+    emu_val = "1" if emu_on else "0"
+    py_val = "1" if py_on else "0"
+    combined = "1" if (emu_on or py_on) else "0"
+    db.set_setting(EMU_LIBRARY_ENABLED_KEY, emu_val)
+    db.set_setting(PY_TOOLS_LIBRARY_ENABLED_KEY, py_val)
+    db.set_setting(PY_LAUNCHER_ENABLED_KEY, combined)
 
 
 def _extras_ai_features_enabled(db):
     """Whether experimental AI tools appear in Extras (Nova AI Chat + HTML Agent tab)."""
     return db.get_setting(EXTRAS_AI_FEATURES_DB_KEY, "0") == "1"
+
+
+def _launcher_paths_from_db(db, key, default_paths):
+    raw = db.get_setting(key, "") if db else ""
+    defaults = [str(p) for p in default_paths if p]
+    saved = []
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                saved = [p for p in data if p and os.path.isdir(p)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return _merge_unique_paths(saved + defaults)
+
+
+def _merge_unique_paths(paths):
+    out = []
+    seen = set()
+    for p in paths:
+        if not p or not os.path.isdir(p):
+            continue
+        try:
+            key = str(Path(p).resolve()).lower()
+        except OSError:
+            key = p.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(str(Path(p).resolve()) if Path(p).exists() else p)
+    return out
+
+
+def _steam_library_paths():
+    paths = []
+    seen = set()
+
+    def _add(path):
+        if not path:
+            return
+        common = Path(path) / "steamapps" / "common"
+        if not common.is_dir():
+            return
+        key = str(common.resolve()).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append(str(common))
+
+    for env_key in ("ProgramFiles(x86)", "ProgramFiles"):
+        base = os.environ.get(env_key, "")
+        if not base:
+            continue
+        _add(str(Path(base) / "Steam"))
+
+    # Zusätzliche Steam-Bibliotheken aus libraryfolders.vdf (z. B. D:\SteamLibrary)
+    steam_roots = set()
+    for env_key in ("ProgramFiles(x86)", "ProgramFiles"):
+        base = os.environ.get(env_key, "")
+        if base:
+            steam_roots.add(str(Path(base) / "Steam"))
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        root = f"{letter}:\\SteamLibrary"
+        if os.path.isdir(root):
+            steam_roots.add(root)
+
+    for steam_root in steam_roots:
+        vdf = Path(steam_root) / "steamapps" / "libraryfolders.vdf"
+        if not vdf.is_file():
+            continue
+        try:
+            text = vdf.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for match in re.finditer(r'"path"\s+"([^"]+)"', text):
+            lib = match.group(1).replace("\\\\", "\\")
+            _add(lib)
+
+    return paths
+
+
+def _extra_emulator_drive_roots():
+    """Typische Emulator-/Spiele-Ordner auf anderen Laufwerken."""
+    roots = []
+    seen = set()
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        drive = f"{letter}:\\"
+        if not os.path.isdir(drive):
+            continue
+        for sub in (
+            "Games", "Emulators", "RetroArch", "SteamLibrary",
+            "Switch-Emulator", "Ryujinx", "Yuzu", "Citra",
+        ):
+            path = Path(drive) / sub
+            if not path.is_dir():
+                continue
+            key = str(path.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(str(path.resolve()))
+    return roots
+
+
+def _is_drive_root(path) -> bool:
+    try:
+        p = Path(path).resolve()
+    except OSError:
+        return False
+    if not p.is_dir() or not p.drive:
+        return False
+    return str(p).rstrip("\\/") == f"{p.drive}\\"
+
+
+def _is_heavy_system_scan_path(path) -> bool:
+    low = str(path).lower().replace("/", "\\")
+    markers = (
+        "\\program files\\",
+        "\\program files (x86)\\",
+        "\\appdata\\local\\",
+        "\\appdata\\roaming\\",
+        "\\windows\\",
+        "\\microsoft\\",
+        "\\packages\\",
+        "\\node_modules\\",
+    )
+    if any(m in low for m in markers):
+        return True
+    if _is_drive_root(path):
+        return True
+    return low.endswith("\\program files") or low.endswith("\\program files (x86)")
+
+
+def _prioritize_scan_paths(paths):
+    """Kleine / benutzerdefinierte Ordner zuerst — System-Laufwerke zuletzt."""
+    light = []
+    heavy = []
+    for path in paths:
+        if _is_heavy_system_scan_path(path):
+            heavy.append(path)
+        else:
+            light.append(path)
+    return light + heavy
+
+
+def _effective_emulator_scan_roots(paths):
+    """Ganze Laufwerke (z. B. D:/) in sinnvolle Unterordner auflösen."""
+    out = []
+    seen = set()
+    for raw in paths:
+        if not raw or not os.path.isdir(raw):
+            continue
+        if _is_drive_root(raw):
+            drive = Path(raw).drive + "\\"
+            added = False
+            for sub in (
+                "RetroArch", "SteamLibrary", "Switch-Emulator", "Ryujinx", "Yuzu",
+                "Citra", "Games", "Emulators", "Program Files", "Program Files (x86)",
+            ):
+                candidate = Path(drive) / sub
+                if not candidate.is_dir():
+                    continue
+                key = str(candidate.resolve()).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(str(candidate.resolve()))
+                added = True
+            if not added:
+                key = str(Path(raw).resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(str(Path(raw).resolve()))
+        else:
+            try:
+                key = str(Path(raw).resolve()).lower()
+            except OSError:
+                key = str(raw).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(str(Path(raw).resolve()) if Path(raw).exists() else raw)
+    return _prioritize_scan_paths(out)
+
+
+def _launcher_scan_paths(db, key, default_paths, *, extra_paths=()):
+    if db:
+        _migrate_launcher_settings(db)
+    saved = []
+    raw = db.get_setting(key, "") if db else ""
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                saved = [p for p in data if p and os.path.isdir(p)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    defaults = [str(p) for p in default_paths if p]
+    extras = list(extra_paths)
+    if key == EMU_LIBRARY_SCAN_PATHS_KEY:
+        extras = list(extras) + _extra_emulator_drive_roots()
+    merged = _merge_unique_paths(list(saved) + list(defaults) + list(extras))
+    if key == EMU_LIBRARY_SCAN_PATHS_KEY:
+        return _effective_emulator_scan_roots(merged)
+    return _prioritize_scan_paths(merged)
+
+
+def _launcher_history_load(db, key):
+    if not db:
+        return []
+    raw = db.get_setting(key, "")
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [p for p in data if p and os.path.exists(p)]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return []
+
+
+def _launcher_history_push(db, key, path, max_items=24):
+    if not db or not path:
+        return []
+    try:
+        norm = str(Path(path).resolve())
+    except OSError:
+        norm = str(path)
+    hist = _launcher_history_load(db, key)
+    hist = [p for p in hist if p.lower() != norm.lower()]
+    hist.insert(0, norm)
+    hist = hist[:max_items]
+    db.set_setting(key, json.dumps(hist))
+    return hist
+
+
+def _launcher_library_cache_key(kind: str) -> str:
+    return EMU_LIBRARY_CACHE_KEY if kind == "emu" else PY_TOOLS_LIBRARY_CACHE_KEY
+
+
+def _subprocess_no_window_kwargs() -> dict:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def _python_for_script_launch() -> str:
+    """Prefer pythonw.exe on Windows to avoid a flashing console window."""
+    if os.name != "nt":
+        return sys.executable
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    return str(pyw) if pyw.is_file() else sys.executable
+
+
+def _snapshot_toplevel_widget_ids():
+    app = QApplication.instance()
+    if app is None:
+        return set()
+    return {id(w) for w in app.topLevelWidgets()}
+
+
+def _hide_new_toplevel_widgets(before_ids):
+    app = QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        if id(widget) in before_ids:
+            continue
+        widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        widget.hide()
+
+
+_LAUNCHER_ICON_CACHE: dict = {}
+
+
+def _launcher_file_icon(path, size=88):
+    key = (str(path).lower(), size)
+    cached = _LAUNCHER_ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    provider = QFileIconProvider()
+    pixmap = provider.icon(QFileInfo(path)).pixmap(size, size)
+    _LAUNCHER_ICON_CACHE[key] = pixmap
+    return pixmap
+
+
+def _launcher_paths_fingerprint(paths) -> str:
+    normalized = []
+    for p in paths or []:
+        if not p:
+            continue
+        try:
+            normalized.append(str(Path(p).resolve()).lower())
+        except OSError:
+            normalized.append(str(p).lower())
+    return hashlib.md5("\n".join(sorted(set(normalized))).encode()).hexdigest()
+
+
+def _launcher_library_cache_load(db, kind, paths):
+    if not db:
+        return []
+    raw = db.get_setting(_launcher_library_cache_key(kind), "")
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    if data.get("paths_fp") != _launcher_paths_fingerprint(paths):
+        return []
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        return []
+    valid = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if not path or not os.path.exists(path):
+            continue
+        valid.append({
+            "path": path,
+            "name": entry.get("name") or Path(path).stem,
+            "subtitle": entry.get("subtitle", ""),
+        })
+    return valid
+
+
+def _launcher_library_cache_save(db, kind, paths, entries):
+    if not db:
+        return
+    payload = {
+        "paths_fp": _launcher_paths_fingerprint(paths),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "entries": [
+            {
+                "path": e.get("path"),
+                "name": e.get("name", Path(e["path"]).stem),
+                "subtitle": e.get("subtitle", ""),
+            }
+            for e in (entries or [])
+            if e.get("path")
+        ],
+    }
+    db.set_setting(_launcher_library_cache_key(kind), json.dumps(payload))
+
+
+def _launcher_manual_key(kind: str) -> str:
+    return EMU_LIBRARY_MANUAL_KEY if kind == "emu" else PY_TOOLS_LIBRARY_MANUAL_KEY
+
+
+def _launcher_manual_load(db, kind):
+    if not db:
+        return []
+    raw = db.get_setting(_launcher_manual_key(kind), "")
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    valid = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if not path or not os.path.exists(path):
+            continue
+        valid.append({
+            "path": path,
+            "name": entry.get("name") or Path(path).stem,
+            "subtitle": entry.get("subtitle", "Manuell"),
+            "manual": True,
+        })
+    return valid
+
+
+def _launcher_manual_save(db, kind, entries):
+    if not db:
+        return
+    db.set_setting(
+        _launcher_manual_key(kind),
+        json.dumps([
+            {
+                "path": e.get("path"),
+                "name": e.get("name", Path(e["path"]).stem),
+                "subtitle": e.get("subtitle", "Manuell"),
+            }
+            for e in (entries or [])
+            if e.get("path")
+        ]),
+    )
+
+
+def _launcher_entry_from_path(kind, path):
+    """Manuell hinzugefügte Datei — ohne Scan-Filter (jede .exe / .py erlaubt)."""
+    p = Path(path)
+    if kind == "emu":
+        if p.suffix.lower() != ".exe" or not p.is_file():
+            return None
+        label = _emulator_entry_label(str(p.resolve()))
+        if label:
+            label["manual"] = True
+            label["subtitle"] = "Manuell"
+            return label
+        return {
+            "path": str(p.resolve()),
+            "name": p.stem,
+            "subtitle": "Manuell",
+            "manual": True,
+        }
+    if p.suffix.lower() != ".py" or not p.is_file():
+        return None
+    entry = _py_script_entry(p)
+    entry["manual"] = True
+    entry["subtitle"] = "Manuell"
+    return entry
+
+
+def _launcher_manual_add(db, kind, path):
+    entry = _launcher_entry_from_path(kind, path)
+    if not entry or not db:
+        return None
+    items = _launcher_manual_load(db, kind)
+    key = entry["path"].lower()
+    items = [e for e in items if e.get("path", "").lower() != key]
+    items.append(entry)
+    _launcher_manual_save(db, kind, items)
+    _launcher_hidden_remove(db, kind, path)
+    return entry
+
+
+def _launcher_manual_remove(db, kind, path):
+    if not db or not path:
+        return False
+    items = _launcher_manual_load(db, kind)
+    key = str(path).lower()
+    kept = [e for e in items if e.get("path", "").lower() != key]
+    if len(kept) == len(items):
+        return False
+    _launcher_manual_save(db, kind, kept)
+    return True
+
+
+def _launcher_hidden_key(kind: str) -> str:
+    return EMU_LIBRARY_HIDDEN_KEY if kind == "emu" else PY_TOOLS_LIBRARY_HIDDEN_KEY
+
+
+def _launcher_hidden_load(db, kind) -> set:
+    if not db:
+        return set()
+    raw = db.get_setting(_launcher_hidden_key(kind), "")
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {str(p).lower() for p in data if p}
+
+
+def _launcher_hidden_save(db, kind, paths):
+    if not db:
+        return
+    db.set_setting(_launcher_hidden_key(kind), json.dumps(sorted(set(paths))))
+
+
+def _launcher_hidden_add(db, kind, path):
+    if not db or not path:
+        return False
+    hidden = _launcher_hidden_load(db, kind)
+    key = str(path).lower()
+    if key in hidden:
+        return False
+    hidden.add(key)
+    _launcher_hidden_save(db, kind, hidden)
+    return True
+
+
+def _launcher_hidden_remove(db, kind, path):
+    if not db or not path:
+        return False
+    hidden = _launcher_hidden_load(db, kind)
+    key = str(path).lower()
+    if key not in hidden:
+        return False
+    hidden.remove(key)
+    _launcher_hidden_save(db, kind, hidden)
+    return True
+
+
+def _launcher_filter_hidden(entries, hidden_paths):
+    if not hidden_paths:
+        return list(entries or [])
+    return [
+        e for e in (entries or [])
+        if e.get("path", "").lower() not in hidden_paths
+    ]
+
+
+def _launcher_merge_entries(*entry_lists):
+    merged = {}
+    for entries in entry_lists:
+        for entry in entries or []:
+            path = entry.get("path")
+            if not path:
+                continue
+            merged[path.lower()] = entry
+    return sorted(merged.values(), key=lambda x: (x.get("name") or Path(x.get("path", "")).stem).lower())
+
+
+def _migrate_launcher_settings(db):
+    """Alte PY-Launcher-Einstellungen einmalig auf zwei Bibliotheken aufteilen."""
+    if not db:
+        return
+    if db.get_setting(_LAUNCHER_SETTINGS_MIGRATED_KEY, "") == "1":
+        return
+
+    legacy_on = db.get_setting(PY_LAUNCHER_ENABLED_KEY, "")
+    has_emu = db.get_setting(EMU_LIBRARY_ENABLED_KEY, "")
+    has_py = db.get_setting(PY_TOOLS_LIBRARY_ENABLED_KEY, "")
+
+    if legacy_on in ("0", "1"):
+        if not has_emu:
+            db.set_setting(EMU_LIBRARY_ENABLED_KEY, legacy_on)
+        if not has_py:
+            db.set_setting(PY_TOOLS_LIBRARY_ENABLED_KEY, legacy_on)
+    elif not has_emu and not has_py:
+        db.set_setting(EMU_LIBRARY_ENABLED_KEY, "1")
+        db.set_setting(PY_TOOLS_LIBRARY_ENABLED_KEY, "1")
+
+    if db.get_setting(PY_LAUNCHER_SCAN_PATHS_KEY, "") and not db.get_setting(
+        EMU_LIBRARY_SCAN_PATHS_KEY, ""
+    ):
+        db.set_setting(EMU_LIBRARY_SCAN_PATHS_KEY, db.get_setting(PY_LAUNCHER_SCAN_PATHS_KEY, ""))
+    if db.get_setting(PY_LAUNCHER_TOOLS_PATHS_KEY, "") and not db.get_setting(
+        PY_TOOLS_LIBRARY_SCAN_PATHS_KEY, ""
+    ):
+        db.set_setting(
+            PY_TOOLS_LIBRARY_SCAN_PATHS_KEY,
+            db.get_setting(PY_LAUNCHER_TOOLS_PATHS_KEY, ""),
+        )
+    db.set_setting(_LAUNCHER_SETTINGS_MIGRATED_KEY, "1")
+
+
+def _emu_library_enabled(db):
+    _migrate_launcher_settings(db)
+    return db.get_setting(EMU_LIBRARY_ENABLED_KEY, "1") == "1"
+
+
+def _py_tools_library_enabled(db):
+    _migrate_launcher_settings(db)
+    return db.get_setting(PY_TOOLS_LIBRARY_ENABLED_KEY, "1") == "1"
+
+
+def _launcher_visible(db):
+    return _emu_library_enabled(db) or _py_tools_library_enabled(db)
+
+
+def _py_launcher_enabled(db):
+    """Kompatibilität — sichtbar wenn mindestens eine Bibliothek aktiv."""
+    return _launcher_visible(db)
 
 
 def _build_multimodal_user_content(text, image_paths, audio_paths):
@@ -3716,6 +4319,19 @@ class MusicDatabase:
         self.cursor.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
         self.conn.commit()
 
+    def wipe_all_lyrics(self):
+        """Clear saved lyrics for every song and video. Returns (songs, videos) cleared."""
+        song_n = self.cursor.execute(
+            "SELECT COUNT(*) FROM songs WHERE lyrics IS NOT NULL AND TRIM(lyrics) != ''"
+        ).fetchone()[0]
+        video_n = self.cursor.execute(
+            "SELECT COUNT(*) FROM videos WHERE lyrics IS NOT NULL AND TRIM(lyrics) != ''"
+        ).fetchone()[0]
+        self.cursor.execute("UPDATE songs SET lyrics=NULL")
+        self.cursor.execute("UPDATE videos SET lyrics=NULL")
+        self.conn.commit()
+        return song_n, video_n
+
     # --- Videos ---
     def add_video(self, title, channel, path, thumbnail_path=None, duration=0, file_size=0, fmt="", resolution="", yt_url=None):
         try:
@@ -3870,7 +4486,7 @@ def nova_extension_dir():
 
 
 class _NovaExtApiHandler(http.server.BaseHTTPRequestHandler):
-    """Local HTTP API for the Nova yt-dlp Chrome extension."""
+    """Local HTTP API for the Nova yt-dlp browser extension (Chrome & Firefox)."""
 
     nova_ref = None
 
@@ -3932,7 +4548,7 @@ class _NovaExtApiHandler(http.server.BaseHTTPRequestHandler):
 
 
 class NovaExtensionServer(threading.Thread):
-    """Background thread serving the Chrome extension on 127.0.0.1."""
+    """Background thread serving the browser extension on 127.0.0.1."""
 
     def __init__(self, nova, port=NOVA_EXT_API_PORT):
         super().__init__(daemon=True)
@@ -3944,7 +4560,7 @@ class NovaExtensionServer(threading.Thread):
         _NovaExtApiHandler.nova_ref = self.nova
         try:
             self._httpd = http.server.HTTPServer(("127.0.0.1", self.port), _NovaExtApiHandler)
-            print(f"[Nova] Chrome extension API listening on http://127.0.0.1:{self.port}")
+            print(f"[Nova] Browser extension API listening on http://127.0.0.1:{self.port}")
             self._httpd.serve_forever()
         except OSError as e:
             print(f"[Nova] Extension API port {self.port} unavailable: {e}")
@@ -6636,7 +7252,7 @@ import hashlib as _hashlib
 import urllib.request as _urllib_req
 
 _NOVA_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova_config.json")
-_NOVA_VERSION = "7.1.8"
+_NOVA_VERSION = "7.1.9"
 _NOVA_UPDATE_URL = (
     "https://raw.githubusercontent.com/NovaX7-Universal/NovaX7/main/NovaX7_7_1_0.py"
 )
@@ -6818,13 +7434,82 @@ class _UpdateFetchThread(QThread):
 
 
 class SettingsDialog(QDialog):
+    @staticmethod
+    def _extras_path_editor(placeholder, initial_lines):
+        edit = QPlainTextEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setMinimumHeight(96)
+        edit.setMaximumHeight(140)
+        edit.setTabChangesFocus(True)
+        edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        edit.setPlainText("\n".join(initial_lines))
+        edit.setStyleSheet(
+            "QPlainTextEdit {"
+            "  background: #12121a;"
+            "  color: #d8dee9;"
+            "  border: 1px solid #3a3a4a;"
+            "  border-radius: 8px;"
+            "  padding: 8px 10px;"
+            "  font-family: Consolas, 'Cascadia Mono', monospace;"
+            "  font-size: 11px;"
+            "}"
+            "QPlainTextEdit:focus { border-color: #5b6ea6; }"
+        )
+        return edit
+
+    @staticmethod
+    def _extras_group(title):
+        group = QGroupBox(title)
+        group.setStyleSheet(
+            "QGroupBox {"
+            "  font-size: 13px;"
+            "  font-weight: 600;"
+            "  color: #ececf1;"
+            "  border: 1px solid #343446;"
+            "  border-radius: 10px;"
+            "  margin-top: 10px;"
+            "  padding-top: 14px;"
+            "}"
+            "QGroupBox::title {"
+            "  subcontrol-origin: margin;"
+            "  left: 12px;"
+            "  padding: 0 6px;"
+            "}"
+        )
+        return group
+
+    @staticmethod
+    def _extras_muted_label(text):
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color: #8892b0; font-size: 11px;")
+        return lbl
+
+    @staticmethod
+    def _extras_action_btn(text):
+        btn = QPushButton(text)
+        btn.setFixedHeight(34)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton {"
+            "  background: #1e1e2a;"
+            "  color: #ececf1;"
+            "  border: 1px solid #3a3a4a;"
+            "  border-radius: 8px;"
+            "  padding: 0 14px;"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover { background: #262636; border-color: #5b6ea6; }"
+        )
+        return btn
+
     def __init__(self, parent, db, current_theme):
         super().__init__(parent)
         self.db = db
         self._upd_thread = None
         self.setWindowTitle("Settings")
-        self.setMinimumSize(560, 560)
-        self.resize(580, 620)
+        self.setMinimumSize(580, 520)
+        self.resize(620, 680)
         layout = QVBoxLayout()
 
         tabs = QTabWidget()
@@ -7210,101 +7895,144 @@ class SettingsDialog(QDialog):
         kb_tab.setLayout(kb_layout)
         tabs.addTab(kb_tab, "Shortcuts")
 
-        # --- Extras (Code eingeben) ---
+        # --- Extras ---
+        extras_scroll = QScrollArea()
+        extras_scroll.setWidgetResizable(True)
+        extras_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        extras_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
         extras_tab = QWidget()
-        extras_layout = QVBoxLayout()
-        extras_layout.setContentsMargins(16, 20, 16, 16)
-        extras_layout.setSpacing(12)
+        extras_layout = QVBoxLayout(extras_tab)
+        extras_layout.setContentsMargins(12, 12, 12, 12)
+        extras_layout.setSpacing(14)
 
-        extras_title = QLabel("🔑  Code einlösen")
-        extras_title.setStyleSheet("font-size: 15px; font-weight: bold;")
-        extras_layout.addWidget(extras_title)
-
-        extras_desc = QLabel("Gib hier einen Code ein, um zusätzliche Funktionen freizuschalten.")
-        extras_desc.setWordWrap(True)
-        extras_desc.setStyleSheet("color: #888; font-size: 12px;")
-        extras_layout.addWidget(extras_desc)
+        code_group = self._extras_group("Code einlösen")
+        code_layout = QVBoxLayout(code_group)
+        code_layout.setSpacing(8)
+        code_layout.addWidget(self._extras_muted_label(
+            "Gib hier einen Code ein, um zusätzliche Funktionen freizuschalten."
+        ))
 
         code_row = QHBoxLayout()
+        code_row.setSpacing(8)
         self.code_input = QLineEdit()
         self.code_input.setPlaceholderText("Code eingeben …")
         self.code_input.setMaxLength(64)
         self.code_input.setFixedHeight(36)
         self.code_input.setStyleSheet(
-            "QLineEdit { border: 1px solid #555; border-radius: 6px; padding: 4px 10px; font-size: 14px; }"
-            "QLineEdit:focus { border-color: #7c6af7; }"
+            "QLineEdit { background: #12121a; color: #ececf1; border: 1px solid #3a3a4a;"
+            "border-radius: 8px; padding: 4px 10px; font-size: 13px; }"
+            "QLineEdit:focus { border-color: #5b6ea6; }"
         )
         self.code_input.returnPressed.connect(self._redeem_code)
-
-        redeem_btn = QPushButton("Einlösen")
-        redeem_btn.setFixedHeight(36)
-        redeem_btn.setFixedWidth(100)
-        redeem_btn.setStyleSheet(
-            "QPushButton { border-radius: 6px; padding: 4px 14px; font-weight: bold; }"
-            "QPushButton:hover { opacity: 0.85; }"
-        )
+        redeem_btn = self._extras_action_btn("Einlösen")
+        redeem_btn.setFixedWidth(108)
         redeem_btn.clicked.connect(self._redeem_code)
-
-        code_row.addWidget(self.code_input)
+        code_row.addWidget(self.code_input, 1)
         code_row.addWidget(redeem_btn)
-        extras_layout.addLayout(code_row)
+        code_layout.addLayout(code_row)
 
         self._code_status = QLabel("")
         self._code_status.setWordWrap(True)
-        self._code_status.setStyleSheet("font-size: 12px; min-height: 20px;")
-        extras_layout.addWidget(self._code_status)
+        self._code_status.setStyleSheet("font-size: 11px; min-height: 18px;")
+        code_layout.addWidget(self._code_status)
+        extras_layout.addWidget(code_group)
 
-        extras_ai_sep = QFrame()
-        extras_ai_sep.setFrameShape(QFrame.Shape.HLine)
-        extras_ai_sep.setFrameShadow(QFrame.Shadow.Sunken)
-        extras_layout.addWidget(extras_ai_sep)
-
-        extras_ai_title = QLabel("🤖  Experimental AI in Extras")
-        extras_ai_title.setStyleSheet("font-size: 15px; font-weight: bold;")
-        extras_layout.addWidget(extras_ai_title)
-
-        extras_ai_desc = QLabel(
-            "Nova AI Chat and the HTML Viewer Agent tab are still in development. "
-            "Slide right to show them on the Extras dashboard; slide left to hide them."
-        )
-        extras_ai_desc.setWordWrap(True)
-        extras_ai_desc.setStyleSheet("color: #888; font-size: 12px;")
-        extras_layout.addWidget(extras_ai_desc)
+        ai_group = self._extras_group("Experimental AI in Extras")
+        ai_layout = QVBoxLayout(ai_group)
+        ai_layout.setSpacing(8)
+        ai_layout.addWidget(self._extras_muted_label(
+            "Nova AI Chat und der HTML-Viewer-Agent sind noch in Entwicklung. "
+            "Schieberegler rechts = in Extras anzeigen."
+        ))
 
         ai_slider_row = QHBoxLayout()
         ai_slider_row.setSpacing(10)
-        ai_hidden_lbl = QLabel("Hidden")
-        ai_hidden_lbl.setStyleSheet("color: #888; font-size: 11px; min-width: 42px;")
+        ai_hidden_lbl = QLabel("Aus")
+        ai_hidden_lbl.setStyleSheet("color: #8892b0; font-size: 11px; min-width: 28px;")
         self.extras_ai_slider = QSlider(Qt.Orientation.Horizontal)
         self.extras_ai_slider.setRange(0, 1)
         self.extras_ai_slider.setPageStep(1)
         self.extras_ai_slider.setSingleStep(1)
-        self.extras_ai_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.extras_ai_slider.setTickInterval(1)
         self.extras_ai_slider.setValue(
             1 if db.get_setting(EXTRAS_AI_FEATURES_DB_KEY, "0") == "1" else 0
         )
         self.extras_ai_slider.setToolTip(
-            "Left = hide Nova AI Chat and the HTML Viewer Agent tab\n"
-            "Right = show unfinished AI tools in Extras"
+            "Links = AI-Tools ausblenden\nRechts = Nova AI Chat + HTML-Agent anzeigen"
         )
-        ai_visible_lbl = QLabel("Visible")
-        ai_visible_lbl.setStyleSheet("color: #888; font-size: 11px; min-width: 42px;")
+        ai_visible_lbl = QLabel("An")
+        ai_visible_lbl.setStyleSheet("color: #8892b0; font-size: 11px; min-width: 28px;")
         ai_slider_row.addWidget(ai_hidden_lbl)
         ai_slider_row.addWidget(self.extras_ai_slider, 1)
         ai_slider_row.addWidget(ai_visible_lbl)
-        extras_layout.addLayout(ai_slider_row)
+        ai_layout.addLayout(ai_slider_row)
 
         self._extras_ai_status = QLabel("")
         self._extras_ai_status.setWordWrap(True)
-        self._extras_ai_status.setStyleSheet("font-size: 12px; min-height: 18px;")
-        extras_layout.addWidget(self._extras_ai_status)
+        self._extras_ai_status.setStyleSheet("color: #8892b0; font-size: 11px;")
+        ai_layout.addWidget(self._extras_ai_status)
         self.extras_ai_slider.valueChanged.connect(self._update_extras_ai_slider_label)
         self._update_extras_ai_slider_label()
+        extras_layout.addWidget(ai_group)
+
+        emu_group = self._extras_group("Emulator-Bibliothek")
+        emu_layout = QVBoxLayout(emu_group)
+        emu_layout.setSpacing(8)
+        emu_layout.addWidget(self._extras_muted_label(
+            "Emulatoren (.exe) finden und starten. Eigener Scan-Verlauf, getrennt von PY-Tools."
+        ))
+        self.emu_library_enabled_cb = QCheckBox("In Extras anzeigen")
+        self.emu_library_enabled_cb.setChecked(_emu_library_enabled(db))
+        self.emu_library_enabled_cb.stateChanged.connect(self._persist_launcher_library_toggles)
+        emu_layout.addWidget(self.emu_library_enabled_cb)
+        emu_layout.addWidget(self._extras_muted_label("Scan-Ordner — ein Pfad pro Zeile:"))
+        emu_scan_paths = _launcher_scan_paths(
+            db, EMU_LIBRARY_SCAN_PATHS_KEY, _default_emulator_scan_roots(),
+            extra_paths=_steam_library_paths(),
+        )
+        self.emu_library_scan_paths = self._extras_path_editor(
+            "z. B. C:\\Program Files\\Emulators", emu_scan_paths
+        )
+        emu_layout.addWidget(self.emu_library_scan_paths)
+        emu_btn_row = QHBoxLayout()
+        emu_btn_row.setContentsMargins(0, 4, 0, 0)
+        emu_scan_add_btn = self._extras_action_btn("Ordner hinzufügen …")
+        emu_scan_add_btn.clicked.connect(self._browse_emu_library_scan_path)
+        emu_btn_row.addWidget(emu_scan_add_btn)
+        emu_btn_row.addStretch()
+        emu_layout.addLayout(emu_btn_row)
+        extras_layout.addWidget(emu_group)
+
+        py_group = self._extras_group("PY-Bibliothek")
+        py_layout = QVBoxLayout(py_group)
+        py_layout.setSpacing(8)
+        py_layout.addWidget(self._extras_muted_label(
+            "Alle .py-Skripte finden und starten. Eigene Ordner und eigener Verlauf."
+        ))
+        self.py_tools_library_enabled_cb = QCheckBox("In Extras anzeigen")
+        self.py_tools_library_enabled_cb.setChecked(_py_tools_library_enabled(db))
+        self.py_tools_library_enabled_cb.stateChanged.connect(self._persist_launcher_library_toggles)
+        py_layout.addWidget(self.py_tools_library_enabled_cb)
+        py_layout.addWidget(self._extras_muted_label("Scan-Ordner für .py-Skripte — ein Pfad pro Zeile:"))
+        py_tools_scan_paths = _launcher_paths_from_db(
+            db, PY_TOOLS_LIBRARY_SCAN_PATHS_KEY, _default_py_tools_scan_roots()
+        )
+        self.py_tools_library_scan_paths = self._extras_path_editor(
+            "Standard: NovaX7/Downloads-Ordner", py_tools_scan_paths
+        )
+        py_layout.addWidget(self.py_tools_library_scan_paths)
+        py_btn_row = QHBoxLayout()
+        py_btn_row.setContentsMargins(0, 4, 0, 0)
+        py_tools_add_btn = self._extras_action_btn("Ordner hinzufügen …")
+        py_tools_add_btn.clicked.connect(self._browse_py_tools_library_scan_path)
+        py_btn_row.addWidget(py_tools_add_btn)
+        py_btn_row.addStretch()
+        py_layout.addLayout(py_btn_row)
+        extras_layout.addWidget(py_group)
 
         extras_layout.addStretch()
-        extras_tab.setLayout(extras_layout)
-        tabs.addTab(extras_tab, "Extras")
+        extras_scroll.setWidget(extras_tab)
+        tabs.addTab(extras_scroll, "Extras")
 
         # --- Update Tab ---
         update_tab = QWidget()
@@ -7517,24 +8245,55 @@ class SettingsDialog(QDialog):
         self.browser_home_url.setText("https://www.google.com")
         self.extras_ai_slider.setValue(0)
         self._update_extras_ai_slider_label()
+        if hasattr(self, "emu_library_enabled_cb"):
+            self.emu_library_enabled_cb.setChecked(True)
+        if hasattr(self, "py_tools_library_enabled_cb"):
+            self.py_tools_library_enabled_cb.setChecked(True)
+
+    def _persist_launcher_library_toggles(self, _state=None):
+        """Launcher-Toggles sofort in DB schreiben (ohne auf Save zu warten)."""
+        if not hasattr(self, "emu_library_enabled_cb") or not hasattr(self, "py_tools_library_enabled_cb"):
+            return
+        _write_launcher_enabled_settings(
+            self.db,
+            self.emu_library_enabled_cb.isChecked(),
+            self.py_tools_library_enabled_cb.isChecked(),
+        )
+        parent = self.parent()
+        if parent and hasattr(parent, "extras_panel"):
+            parent.extras_panel.refresh_extras_dashboard()
 
     def _update_extras_ai_slider_label(self, _value=None):
         visible = self.extras_ai_slider.value() == 1
         if visible:
-            self._extras_ai_status.setStyleSheet("color: #8892b0; font-size: 12px; min-height: 18px;")
             self._extras_ai_status.setText(
-                "Nova AI Chat and the HTML Viewer Agent tab will appear in Extras."
+                "Nova AI Chat und der HTML-Viewer-Agent erscheinen in Extras."
             )
         else:
-            self._extras_ai_status.setStyleSheet("color: #8892b0; font-size: 12px; min-height: 18px;")
             self._extras_ai_status.setText(
-                "AI tools stay hidden — HTML Viewer Code and Preview tabs remain available."
+                "AI-Tools bleiben ausgeblendet — HTML Viewer Code & Preview bleiben verfügbar."
             )
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Watch Folder")
         if folder:
             self.watch_folder.setText(folder)
+
+    def _append_path_line(self, plain_edit, folder):
+        lines = [ln.strip() for ln in plain_edit.toPlainText().splitlines() if ln.strip()]
+        if folder not in lines:
+            lines.append(folder)
+        plain_edit.setPlainText("\n".join(lines))
+
+    def _browse_emu_library_scan_path(self):
+        folder = QFileDialog.getExistingDirectory(self, "Scan-Ordner für Emulatoren")
+        if folder:
+            self._append_path_line(self.emu_library_scan_paths, folder)
+
+    def _browse_py_tools_library_scan_path(self):
+        folder = QFileDialog.getExistingDirectory(self, "Scan-Ordner für PY-Tools")
+        if folder:
+            self._append_path_line(self.py_tools_library_scan_paths, folder)
 
     def save(self):
         self.db.set_setting("theme", self.theme_combo.currentText())
@@ -7578,6 +8337,23 @@ class SettingsDialog(QDialog):
             EXTRAS_AI_FEATURES_DB_KEY,
             "1" if self.extras_ai_slider.value() == 1 else "0",
         )
+        _write_launcher_enabled_settings(
+            self.db,
+            self.emu_library_enabled_cb.isChecked(),
+            self.py_tools_library_enabled_cb.isChecked(),
+        )
+        emu_scan_lines = [
+            ln.strip()
+            for ln in self.emu_library_scan_paths.toPlainText().splitlines()
+            if ln.strip()
+        ]
+        self.db.set_setting(EMU_LIBRARY_SCAN_PATHS_KEY, json.dumps(emu_scan_lines))
+        py_tools_scan_lines = [
+            ln.strip()
+            for ln in self.py_tools_library_scan_paths.toPlainText().splitlines()
+            if ln.strip()
+        ]
+        self.db.set_setting(PY_TOOLS_LIBRARY_SCAN_PATHS_KEY, json.dumps(py_tools_scan_lines))
         self.accept()
 
     def _redeem_code(self):
@@ -12355,6 +13131,1470 @@ class NovaAiChatPanel(QWidget):
         self._unload_model()
 
 
+# ──────────────────────────── PY LAUNCHER (Extras) ────────────────────────────
+
+_EMULATOR_TOOL_META = {
+    "cia_to_3ds.py": (
+        "CIA → 3DS",
+        "Konvertiert .cia in .3ds (ohne boot9.bin, native Entschlüsselung).",
+    ),
+    "python_convert.py": (
+        "CIA → 3DS (pyctr)",
+        "hShop .cia mit pyctr extrahieren — benötigt pip install pyctr.",
+    ),
+}
+
+_EMULATOR_SKIP_NAMES = re.compile(
+    r"^(NovaX7|nova_|snake|equalizer|block_blast|import pygame|gemini-code)",
+    re.I,
+)
+
+_EMULATOR_NAME_HINTS = (
+    "cia", "3ds", "convert", "nds", "gba", "rom", "cci", "ncsd", "emulator",
+)
+
+_EMULATOR_UI_CLASSES = ("MainWindow", "CIAConverterApp", "ConverterApp", "ConvertApp")
+
+_EMULATOR_EXE_HINTS = (
+    "citra", "melonds", "melon", "yuzu", "ryujinx", "dolphin", "cemu", "pcsx2",
+    "rpcs3", "retroarch", "ppsspp", "desmume", "mgba", "bizhawk", "xemu",
+    "duckstation", "vita3k", "xenia", "snes9x", "project64", "mame", "duck",
+    "epsxe", "scummvm", "dolphin", "citra-qt", "emulator", "jgenesis",
+    "ares", "bsnes", "higan", "fceux", "nestopia", "genesis", "dolphin-emu",
+)
+
+_EMULATOR_WALK_SKIP = frozenset({
+    ".git", ".svn", "node_modules", "windows", "winsxs", "system volume information",
+    "$recycle.bin", "cache", "caches", "temp", "tmp", "logs", "log",
+    "__pycache__", ".venv", "venv", "site-packages",
+    "microsoft", "windowsapps", "reference assemblies", "common files",
+    "internet explorer", "windows defender", "windows kits", "microsoft.net",
+    "dotnet", "nuget", "package cache", "packages", "installer", "installers",
+    "google", "mozilla", "nvidia", "nvidia corporation", "amd", "intel",
+    "oracle", "java", "jre", "electron", "backup", "backups", "crash",
+    "update", "updates", "msbuild", "sdk",
+})
+
+_EMULATOR_SCAN_MAX_DEPTH = 6
+_EMULATOR_SCAN_MAX_DIRS = 5000
+_EMULATOR_SCAN_MAX_SECONDS = 25.0
+_EMULATOR_QUICK_GLOB_DEPTH = 7
+
+def _launcher_walk_dirs(scan_paths, stop_cb, progress_cb=None, *, skip_heavy=True):
+    """Ordner-Walk für Launcher-Scans — überspringt riesige System-/Laufwerks-Wurzeln."""
+    import time
+    start = time.monotonic()
+    dirs_seen = 0
+    last_progress = 0.0
+
+    for root in scan_paths:
+        if stop_cb():
+            return
+        if skip_heavy and _is_heavy_system_scan_path(root):
+            continue
+        root_path = Path(root)
+        if not root_path.is_dir():
+            continue
+        if progress_cb:
+            progress_cb(f"Scanne: {root_path.name} …")
+        root_str = str(root_path)
+
+        for dirpath, dirnames, filenames in os.walk(root_str, topdown=True):
+            if stop_cb():
+                return
+            elapsed = time.monotonic() - start
+            if elapsed >= _EMULATOR_SCAN_MAX_SECONDS:
+                if progress_cb:
+                    progress_cb("Zeitlimit — zeige bisherige Treffer …")
+                return
+            dirs_seen += 1
+            if dirs_seen > _EMULATOR_SCAN_MAX_DIRS:
+                if progress_cb:
+                    progress_cb("Ordner-Limit — zeige bisherige Treffer …")
+                return
+
+            rel = os.path.relpath(dirpath, root_str)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if depth >= _EMULATOR_SCAN_MAX_DEPTH:
+                dirnames.clear()
+            else:
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d.lower() not in _EMULATOR_WALK_SKIP and not d.startswith(".")
+                ]
+
+            if progress_cb and elapsed - last_progress >= 0.35:
+                progress_cb(f"Scanne: {root_path.name} … ({dirs_seen} Ordner)")
+                last_progress = elapsed
+
+            yield dirpath, filenames, Path(dirpath).name
+
+_EMULATOR_JUNK_EXE = re.compile(
+    r"(^uninstall$|^unins\d*|setup|installer|updater|update|maintenance|crashpad|helper|"
+    r"win64-setup|win32-setup|-setup$)",
+    re.I,
+)
+
+_EMULATOR_PRETTY_NAMES = {
+    "retroarch": "RetroArch",
+    "ryujinx": "Ryujinx",
+    "citra": "Citra",
+    "citra-qt": "Citra",
+    "melonds": "melonDS",
+    "yuzu": "Yuzu",
+    "dolphin": "Dolphin",
+    "cemu": "Cemu",
+    "pcsx2": "PCSX2",
+    "rpcs3": "RPCS3",
+    "ppsspp": "PPSSPP",
+    "desmume": "DeSmuME",
+    "mgba": "mGBA",
+    "duckstation": "DuckStation",
+    "xenia": "Xenia",
+    "xemu": "Xemu",
+    "vita3k": "Vita3K",
+}
+
+_EMULATOR_FOLDER_NOISE = frozenset({
+    "bin", "binaries", "x64", "win64", "win32", "tools", "release", "debug",
+    "dist", "build", "app", "application",
+})
+
+
+def _launcher_ui_colors(theme):
+    """Neutral Steam-like colors — never accent/hover_border outlines."""
+    card = theme.get("card", "#1a1a2e")
+    text = theme.get("text", "#e6edf3")
+    sub = theme.get("subtext", "#8892b0")
+    return {
+        "tile_bg": _mix_hex(card, "#000000", 0.12),
+        "tile_bg_hover": _mix_hex(card, text, 0.08),
+        "icon_bg": _mix_hex(card, "#000000", 0.38),
+        "border": _mix_hex(card, sub, 0.32),
+        "border_hover": _mix_hex(card, text, 0.16),
+        "text": text,
+        "subtext": sub,
+    }
+
+
+def _is_junk_emulator_exe(stem: str) -> bool:
+    s = stem.lower().strip()
+    if not s:
+        return True
+    if s in {"uninstall", "setup", "installer", "update"}:
+        return True
+    return bool(_EMULATOR_JUNK_EXE.search(s))
+
+
+def _pretty_emulator_name(stem: str) -> str:
+    key = stem.lower().replace(" ", "")
+    for hint, label in _EMULATOR_PRETTY_NAMES.items():
+        if hint in key:
+            return label
+    return stem.replace("-", " ").replace("_", " ").strip().title()
+
+
+def _emulator_channel_label(path_parts) -> str:
+    joined = " ".join(p.lower() for p in path_parts)
+    for label, keys in (
+        ("Steam", ("steamapps", "steam")),
+        ("Stable", ("stable", "retroarch-win64", "retroarch-win32")),
+        ("Portable", ("portable",)),
+        ("Nightly", ("nightly",)),
+        ("Beta", ("beta", "canary")),
+    ):
+        if any(k in joined for k in keys):
+            return label
+    return ""
+
+
+def _emulator_install_root(exe_path: Path) -> str:
+    folder = exe_path.parent
+    if folder.name.lower() in _EMULATOR_FOLDER_NOISE:
+        folder = folder.parent
+    try:
+        return str(folder.resolve()).lower()
+    except OSError:
+        return str(folder).lower()
+
+
+def _exe_launch_priority(stem: str) -> int:
+    if _is_junk_emulator_exe(stem):
+        return 1000
+    s = stem.lower()
+    if s in _EMULATOR_PRETTY_NAMES or s.replace("-", "") in _EMULATOR_PRETTY_NAMES:
+        return 0
+    if any(h in s for h in _EMULATOR_EXE_HINTS):
+        return 1
+    return 10
+
+
+def _emulator_entry_label(exe_path: str):
+    """Anzeigename + Untertitel; None = Junk/Skip."""
+    p = Path(exe_path)
+    stem = p.stem
+    if _is_junk_emulator_exe(stem):
+        return None
+
+    name = _pretty_emulator_name(stem)
+    channel = _emulator_channel_label(p.parts[-7:-1])
+    parent = p.parent.name
+
+    if channel:
+        display = f"{name} · {channel}"
+        subtitle = channel
+    elif parent.lower() not in _EMULATOR_FOLDER_NOISE and parent.lower() != stem.lower():
+        display = f"{name} · {parent}"
+        subtitle = parent
+    else:
+        display = name
+        try:
+            subtitle = p.parent.parent.name if p.parent.name.lower() in _EMULATOR_FOLDER_NOISE else p.parent.name
+        except IndexError:
+            subtitle = p.parent.name
+
+    if subtitle.lower() in (name.lower(), stem.lower(), "steamapps", "common"):
+        subtitle = ""
+
+    return {
+        "path": str(p.resolve()),
+        "name": display,
+        "subtitle": subtitle,
+        "sort": (name.lower(), channel.lower(), str(p).lower()),
+    }
+
+
+def _finalize_emulator_scan(found_by_path: dict) -> list:
+    """Pro Installationsordner bestes .exe wählen, Steam/Stable getrennt benennen."""
+    by_install = {}
+    for raw in found_by_path.values():
+        label = _emulator_entry_label(raw["path"])
+        if not label:
+            continue
+        install_key = _emulator_install_root(Path(label["path"]))
+        prio = _exe_launch_priority(Path(label["path"]).stem)
+        prev = by_install.get(install_key)
+        if prev is None or prio < prev[0]:
+            by_install[install_key] = (prio, label)
+
+    results = [item[1] for item in by_install.values()]
+    results.sort(key=lambda x: x["sort"])
+    return results
+
+
+def _emulator_tools_dir():
+    return Path(__file__).resolve().parent
+
+
+def discover_py_launcher_scripts(db=None):
+    """Alle startbaren .py in den konfigurierten PY-Bibliothek-Ordnern."""
+    default = _default_py_tools_scan_roots()
+    if db:
+        _migrate_launcher_settings(db)
+        roots = _launcher_scan_paths(db, PY_TOOLS_LIBRARY_SCAN_PATHS_KEY, default)
+    else:
+        roots = _merge_unique_paths(default)
+    found = []
+    seen = set()
+
+    def _stop():
+        return False
+
+    for dirpath, filenames, _folder in _launcher_walk_dirs(roots, _stop):
+        for fn in filenames:
+            if not fn.lower().endswith(".py"):
+                continue
+            path = Path(dirpath) / fn
+            if not _is_launchable_py_script(path):
+                continue
+            try:
+                key = str(path.resolve()).lower()
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            entry = _py_script_entry(path)
+            found.append(entry)
+    return found
+
+
+discover_emulator_converter_scripts = discover_py_launcher_scripts
+
+
+def _default_emulator_scan_roots():
+    roots = []
+    home = Path.home()
+    candidates = [
+        home / "Downloads",
+        home / "Desktop",
+        home / "Documents",
+        home / "Games",
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+        Path(os.environ.get("LOCALAPPDATA", "")),
+        Path(os.environ.get("APPDATA", "")),
+    ]
+    seen = set()
+    for path in candidates:
+        if not path or not path.is_dir():
+            continue
+        resolved = str(path.resolve())
+        key = resolved.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(resolved)
+    return roots
+
+
+def _collect_emulator_exe_at_root(root, found: dict, stop_cb, *, max_glob_depth=None):
+    """Schneller Pass: .exe in der Nähe des Scan-Ordners (findet Treffer sofort)."""
+    base = Path(root)
+    if not base.is_dir() or stop_cb():
+        return
+    depth_limit = max_glob_depth
+    if depth_limit is None:
+        depth_limit = 4 if _is_heavy_system_scan_path(root) else _EMULATOR_QUICK_GLOB_DEPTH
+
+    def _maybe_add(full: Path):
+        if not full.is_file():
+            return
+        if _is_junk_emulator_exe(full.stem):
+            return
+        if not _exe_matches_emulator_hint(full.name, full.parent.name, full):
+            return
+        try:
+            key = str(full.resolve()).lower()
+        except OSError:
+            return
+        if key not in found:
+            found[key] = {"path": str(full.resolve())}
+
+    def _walk_dir(path: Path, depth: int):
+        if stop_cb() or depth > depth_limit:
+            return
+        try:
+            entries = list(os.scandir(path))
+        except OSError:
+            return
+        for entry in entries:
+            if stop_cb():
+                return
+            try:
+                if entry.is_file(follow_symlinks=False):
+                    if entry.name.lower().endswith(".exe"):
+                        _maybe_add(Path(entry.path))
+                elif entry.is_dir(follow_symlinks=False):
+                    name = entry.name.lower()
+                    if name in _EMULATOR_WALK_SKIP or entry.name.startswith("."):
+                        continue
+                    _walk_dir(Path(entry.path), depth + 1)
+            except OSError:
+                continue
+
+    _walk_dir(base, 0)
+
+
+def _collect_py_tools_at_root(root, found: dict, stop_cb):
+    base = Path(root)
+    if not base.is_dir() or stop_cb():
+        return
+    patterns = ("*.py", "*/*.py", "*/*/*.py", "*/*/*/*.py")
+    for pattern in patterns:
+        if stop_cb():
+            return
+        try:
+            matches = list(base.glob(pattern))
+        except OSError:
+            continue
+        for full in matches:
+            if not full.is_file():
+                continue
+            if not _is_launchable_py_script(full):
+                continue
+            try:
+                key = str(full.resolve()).lower()
+            except OSError:
+                continue
+            if key in found:
+                continue
+            found[key] = _py_script_entry(full)
+
+
+def _default_py_tools_scan_roots():
+    return [str(_emulator_tools_dir())]
+
+
+def _is_launchable_py_script(path: Path) -> bool:
+    """Prüft ob eine .py-Datei in der PY-Bibliothek erscheinen/starten darf."""
+    if not path.name.lower().endswith(".py"):
+        return False
+    if _EMULATOR_SKIP_NAMES.match(path.name):
+        return False
+    if path.name.lower() in ("__init__.py", "conftest.py"):
+        return False
+    try:
+        if path.resolve() == Path(__file__).resolve():
+            return False
+    except OSError:
+        pass
+    return True
+
+
+def _py_script_entry(path: Path) -> dict:
+    title = _EMULATOR_TOOL_META.get(
+        path.name,
+        (path.stem.replace("_", " ").title(),),
+    )[0]
+    return {
+        "path": str(path.resolve()),
+        "name": title,
+        "file": path.name,
+        "subtitle": path.parent.name,
+    }
+
+
+def _looks_like_emulator_converter(path: Path, *, read_content=True) -> bool:
+    """Legacy-Helfer — weiterhin für gezielte Konverter-Erkennung nutzbar."""
+    name = path.name.lower()
+    if _EMULATOR_SKIP_NAMES.match(path.name):
+        return False
+    if name in _EMULATOR_TOOL_META:
+        return True
+    if any(h in name for h in _EMULATOR_NAME_HINTS):
+        return True
+    if not read_content:
+        return False
+    try:
+        with open(path, "rb") as handle:
+            text = handle.read(16384).decode("utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+    if "convert" not in text and "konvert" not in text:
+        return False
+    return any(k in text for k in ("cia", ".3ds", "ncch", "ncsd", "pyctr", "nds", "gba"))
+
+
+def _py_tool_title_for_path(path) -> str:
+    name = Path(path).name
+    return _EMULATOR_TOOL_META.get(
+        name,
+        (Path(path).stem.replace("_", " ").title(),),
+    )[0]
+
+
+def _is_steam_common_exe(exe_path: Path) -> bool:
+    parts = [p.lower() for p in exe_path.parts]
+    return "steamapps" in parts and "common" in parts
+
+
+def _steam_common_game_folder(exe_path: Path) -> str:
+    parts = [p.lower() for p in exe_path.parts]
+    try:
+        idx = parts.index("common")
+    except ValueError:
+        return ""
+    if idx + 1 >= len(parts):
+        return ""
+    return parts[idx + 1]
+
+
+def _exe_matches_emulator_hint(exe_name: str, folder_name: str, exe_path: Path | None = None) -> bool:
+    stem = exe_name.lower()
+    if any(h in stem for h in _EMULATOR_EXE_HINTS):
+        return True
+    if exe_path is not None:
+        for part in exe_path.parts[-6:-1]:
+            low = part.lower()
+            if any(h in low for h in _EMULATOR_EXE_HINTS):
+                return True
+            if any(k in low for k in ("emulator", "retro", "switch")):
+                return True
+        if _is_steam_common_exe(exe_path):
+            game = _steam_common_game_folder(exe_path)
+            if any(h in game for h in _EMULATOR_EXE_HINTS):
+                return True
+            if any(k in game for k in ("emulator", "retro", "switch")):
+                return True
+    folder = folder_name.lower()
+    if any(h in folder for h in _EMULATOR_EXE_HINTS):
+        return True
+    if any(k in folder for k in ("emulator", "retro", "switch")):
+        return True
+    return False
+
+
+def _load_emulator_tool_widget(script_path: Path, parent=None):
+    """Lädt ein PyQt-Widget aus einer externen .py."""
+    mod_name = "nova_emu_" + hashlib.md5(str(script_path).encode()).hexdigest()[:10]
+    spec = importlib.util.spec_from_file_location(mod_name, str(script_path))
+    if not spec or not spec.loader:
+        return None, "Modul konnte nicht geladen werden."
+    module = importlib.util.module_from_spec(spec)
+    before_widgets = _snapshot_toplevel_widget_ids()
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        return None, f"{script_path.name}: {exc}"
+    finally:
+        _hide_new_toplevel_widgets(before_widgets)
+
+    candidates = []
+    for name, obj in vars(module).items():
+        if not isinstance(obj, type) or not issubclass(obj, QWidget) or obj is QWidget:
+            continue
+        if name.startswith("_"):
+            continue
+        prio = 0 if name in _EMULATOR_UI_CLASSES else 1
+        candidates.append((prio, name, obj))
+    if not candidates:
+        return None, f"{script_path.name}: keine PyQt-Oberfläche gefunden."
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    cls = candidates[0][2]
+    before_widgets = _snapshot_toplevel_widget_ids()
+    try:
+        widget = cls(parent)
+    except TypeError:
+        try:
+            widget = cls()
+        except Exception as exc:
+            return None, str(exc)
+    finally:
+        _hide_new_toplevel_widgets(before_widgets)
+    if parent is not None:
+        widget.setParent(parent)
+    if widget.isWindow():
+        widget.setWindowFlags(Qt.WindowType.Widget)
+    widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, False)
+    return widget, None
+
+
+class EmulatorScanWorker(QThread):
+    """Sucht .exe-Emulatoren in konfigurierten Ordnern (Hintergrund-Thread)."""
+    finished_signal = pyqtSignal(list)
+    progress_signal = pyqtSignal(str)
+    partial_signal = pyqtSignal(list)
+
+    def __init__(self, scan_paths, parent=None, *, scan_seq=0):
+        super().__init__(parent)
+        self.scan_paths = list(scan_paths or [])
+        self.scan_seq = scan_seq
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def _stopped(self):
+        return self._stop
+
+    def run(self):
+        found = {}
+        try:
+            ordered = _effective_emulator_scan_roots(self.scan_paths)
+            for root in ordered:
+                if self._stop:
+                    break
+                label = Path(root).name or root
+                self.progress_signal.emit(f"Schnellsuche: {label} …")
+                _collect_emulator_exe_at_root(root, found, self._stopped)
+
+            quick = _finalize_emulator_scan(found)
+            if quick:
+                self.partial_signal.emit(quick)
+                self.progress_signal.emit(
+                    f"{len(quick)} Emulator(en) gefunden — vertiefe Suche …"
+                )
+
+            for dirpath, filenames, folder_name in _launcher_walk_dirs(
+                ordered,
+                self._stopped,
+                lambda msg: self.progress_signal.emit(msg),
+                skip_heavy=True,
+            ):
+                if self._stop:
+                    break
+                for fn in filenames:
+                    if not fn.lower().endswith(".exe"):
+                        continue
+                    if _is_junk_emulator_exe(Path(fn).stem):
+                        continue
+                    full = Path(dirpath) / fn
+                    if not _exe_matches_emulator_hint(fn, folder_name, full):
+                        continue
+                    try:
+                        key = str(full.resolve()).lower()
+                    except OSError:
+                        continue
+                    if key in found:
+                        continue
+                    found[key] = {"path": str(full.resolve())}
+        finally:
+            results = _finalize_emulator_scan(found)
+            self.finished_signal.emit(results)
+
+
+class PyToolsScanWorker(QThread):
+    """Sucht .py-Skripte in konfigurierten Ordnern (Hintergrund-Thread)."""
+    finished_signal = pyqtSignal(list)
+    progress_signal = pyqtSignal(str)
+
+    def __init__(self, scan_paths, parent=None, *, scan_seq=0):
+        super().__init__(parent)
+        self.scan_paths = list(scan_paths or [])
+        self.scan_seq = scan_seq
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def _stopped(self):
+        return self._stop
+
+    def run(self):
+        found = {}
+        try:
+            ordered = _prioritize_scan_paths(self.scan_paths)
+            for root in ordered:
+                if self._stop:
+                    break
+                _collect_py_tools_at_root(root, found, self._stopped)
+            for dirpath, filenames, _folder in _launcher_walk_dirs(
+                ordered,
+                self._stopped,
+                lambda msg: self.progress_signal.emit(msg),
+                skip_heavy=True,
+            ):
+                if self._stop:
+                    break
+                for fn in filenames:
+                    if not fn.lower().endswith(".py"):
+                        continue
+                    full = Path(dirpath) / fn
+                    if not _is_launchable_py_script(full):
+                        continue
+                    try:
+                        key = str(full.resolve()).lower()
+                    except OSError:
+                        continue
+                    if key in found:
+                        continue
+                    found[key] = _py_script_entry(full)
+        finally:
+            results = sorted(found.values(), key=lambda x: x["name"].lower())
+            self.finished_signal.emit(results)
+
+
+class _LibraryTile(QFrame):
+    """Steam-ähnliche Kachel (Emulatoren + PY-Tools)."""
+
+    def __init__(
+        self,
+        item_path,
+        title,
+        theme,
+        on_launch,
+        fallback_icon="🎮",
+        subtitle="",
+        parent=None,
+        *,
+        on_remove=None,
+    ):
+        super().__init__(parent)
+        self.item_path = item_path
+        self.on_launch = on_launch
+        self._on_remove = on_remove
+        self._theme_ref = theme
+        self._hovering = False
+        self.setObjectName("library_tile")
+        self.setFixedSize(168, 196)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(4)
+        lay.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        self._icon_wrap = QFrame()
+        self._icon_wrap.setObjectName("library_icon_wrap")
+        self._icon_wrap.setFixedSize(152, 112)
+        icon_wrap_lay = QVBoxLayout(self._icon_wrap)
+        icon_wrap_lay.setContentsMargins(8, 8, 8, 8)
+
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setFixedSize(88, 88)
+        self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._icon_lbl.setScaledContents(True)
+        pixmap = _launcher_file_icon(item_path, 88)
+        if pixmap.isNull():
+            self._icon_lbl.setText(fallback_icon)
+            self._icon_lbl.setFont(QFont("Segoe UI", 34))
+            self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        else:
+            self._icon_lbl.setPixmap(pixmap)
+        icon_wrap_lay.addWidget(self._icon_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._icon_wrap)
+
+        self._title_lbl = QLabel(title)
+        self._title_lbl.setWordWrap(True)
+        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._title_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
+        self._title_lbl.setMaximumHeight(34)
+        lay.addWidget(self._title_lbl)
+
+        self._subtitle_lbl = QLabel(subtitle or "")
+        self._subtitle_lbl.setWordWrap(True)
+        self._subtitle_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._subtitle_lbl.setFont(QFont("Segoe UI", 8))
+        self._subtitle_lbl.setMaximumHeight(24)
+        self._subtitle_lbl.setVisible(bool(subtitle))
+        lay.addWidget(self._subtitle_lbl)
+
+        self._apply_theme(theme)
+
+        if on_remove:
+            self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.customContextMenuRequested.connect(self._show_context_menu)
+
+    def _show_context_menu(self, pos):
+        if not self._on_remove:
+            return
+        menu = QMenu(self)
+        remove_act = menu.addAction("Entfernen")
+        if menu.exec(self.mapToGlobal(pos)) == remove_act:
+            self._on_remove(self.item_path)
+
+    def _apply_theme(self, theme):
+        self._theme_ref = theme
+        c = _launcher_ui_colors(theme)
+        bg = c["tile_bg_hover"] if self._hovering else c["tile_bg"]
+        border = c["border_hover"] if self._hovering else c["border"]
+        self.setStyleSheet(f"""
+            QFrame#library_tile {{
+                background-color: {bg};
+                border: 1px solid {border};
+                border-radius: 12px;
+            }}
+            QFrame#library_icon_wrap {{
+                background-color: {c['icon_bg']};
+                border: none;
+                border-radius: 8px;
+            }}
+        """)
+        self._title_lbl.setStyleSheet(f"color: {c['text']}; background: transparent;")
+        self._subtitle_lbl.setStyleSheet(f"color: {c['subtext']}; background: transparent;")
+        self._icon_lbl.setStyleSheet("background: transparent;")
+
+    def enterEvent(self, event):
+        self._hovering = True
+        self._apply_theme(self._theme_ref)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovering = False
+        self._apply_theme(self._theme_ref)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.on_launch:
+            self.on_launch(self.item_path)
+        super().mouseReleaseEvent(event)
+
+
+class _LauncherLibraryView(QWidget):
+    """Eine Bibliothek: Verlauf + Scan-Ergebnisse im gleichen Steam-Layout."""
+    py_script_open_requested = pyqtSignal(str)
+
+    _LIBRARY_COLS = 5
+
+    def __init__(
+        self,
+        extras_panel,
+        *,
+        kind,
+        section_title,
+        empty_hint,
+        settings_section,
+        fallback_icon,
+    ):
+        super().__init__(extras_panel)
+        self.extras_panel = extras_panel
+        self.kind = kind
+        self.section_title = section_title
+        self.empty_hint = empty_hint
+        self.settings_section = settings_section
+        self.fallback_icon = fallback_icon
+        self.scan_paths_key = (
+            EMU_LIBRARY_SCAN_PATHS_KEY if kind == "emu" else PY_TOOLS_LIBRARY_SCAN_PATHS_KEY
+        )
+        self.history_key = (
+            EMU_LIBRARY_HISTORY_KEY if kind == "emu" else PY_TOOLS_LIBRARY_HISTORY_KEY
+        )
+        self.default_roots = (
+            _default_emulator_scan_roots() if kind == "emu" else _default_py_tools_scan_roots()
+        )
+        self._scan_worker = None
+        self._scan_seq = 0
+        self._library_loaded = False
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 8, 0, 12)
+        outer.setSpacing(14)
+
+        self.scan_status = QLabel("Bibliothek wird geladen …")
+        self.scan_status.setStyleSheet("color: #8892b0; font-size: 11px;")
+        self.refresh_btn = QPushButton("↻  Aktualisieren")
+        self.refresh_btn.setObjectName("toolbar_btn")
+        self.refresh_btn.setFixedHeight(28)
+        self.refresh_btn.setToolTip("Bibliothek neu scannen")
+        self.refresh_btn.clicked.connect(self.refresh_library)
+        self.add_file_btn = QPushButton("＋  Datei")
+        self.add_file_btn.setObjectName("toolbar_btn")
+        self.add_file_btn.setFixedHeight(28)
+        self.add_file_btn.setToolTip(
+            "Einzelne .exe-Datei hinzufügen" if self.kind == "emu"
+            else "Einzelne .py-Datei hinzufügen"
+        )
+        self.add_file_btn.clicked.connect(self._add_manual_file)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        status_row.addWidget(self.scan_status, 1)
+        status_row.addWidget(self.add_file_btn)
+        status_row.addWidget(self.refresh_btn)
+        outer.addLayout(status_row)
+
+        self.history_title = QLabel("Zuletzt gestartet")
+        self.history_title.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
+        self.history_title.setStyleSheet("color: #8892b0;")
+        self.history_title.setVisible(False)
+        outer.addWidget(self.history_title)
+
+        self.history_host = QWidget()
+        self.history_host_layout = QHBoxLayout(self.history_host)
+        self.history_host_layout.setContentsMargins(0, 0, 0, 0)
+        self.history_host_layout.setSpacing(0)
+        self.history_inner = QWidget()
+        self.history_grid = QGridLayout(self.history_inner)
+        self.history_grid.setSpacing(10)
+        self.history_grid.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self.history_host_layout.addWidget(self.history_inner)
+        self.history_host_layout.addStretch()
+        outer.addWidget(self.history_host)
+
+        self.section_sep = QFrame()
+        self.section_sep.setFrameShape(QFrame.Shape.HLine)
+        self.section_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self.section_sep.setStyleSheet("color: #2a2a3a;")
+        outer.addWidget(self.section_sep)
+
+        lib_hdr = QLabel(self.section_title)
+        lib_hdr.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        outer.addWidget(lib_hdr)
+
+        self.library_host = QWidget()
+        self.library_host_layout = QHBoxLayout(self.library_host)
+        self.library_host_layout.setContentsMargins(0, 0, 0, 0)
+        self.library_host_layout.setSpacing(0)
+        self.library_inner = QWidget()
+        self.library_grid = QGridLayout(self.library_inner)
+        self.library_grid.setSpacing(10)
+        self.library_grid.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self.library_host_layout.addWidget(self.library_inner)
+        self.library_host_layout.addStretch()
+        outer.addWidget(self.library_host)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.MinimumExpanding,
+        )
+
+
+    def load_library(self, *, force_rescan=False):
+        """Gespeicherte Treffer anzeigen; nur bei Bedarf neu scannen."""
+        if self._scan_worker and self._scan_worker.isRunning():
+            return
+
+        def _load():
+            self.refresh_history()
+            paths = self._scan_paths()
+            db = getattr(self.extras_panel, "db", None)
+            manual = _launcher_manual_load(db, self.kind)
+            if not force_rescan:
+                cached = _launcher_library_cache_load(db, self.kind, paths)
+                if cached or manual:
+                    self._display_entries(_launcher_merge_entries(cached, manual))
+                    self._library_loaded = True
+                    return
+            self.start_scan()
+
+        self._with_bulk_ui_update(_load)
+
+    def refresh_library(self):
+        """Manuell neu scannen und Cache aktualisieren."""
+        self._stop_active_scan()
+        self._library_loaded = False
+        self.start_scan()
+
+    def _current_entries(self, scanned_entries=None):
+        db = getattr(self.extras_panel, "db", None)
+        paths = self._scan_paths()
+        if scanned_entries is None:
+            scanned_entries = _launcher_library_cache_load(db, self.kind, paths)
+        hidden = _launcher_hidden_load(db, self.kind)
+        merged = _launcher_merge_entries(scanned_entries, _launcher_manual_load(db, self.kind))
+        return _launcher_filter_hidden(merged, hidden)
+
+    def _display_entries(self, entries):
+        def _render():
+            return self._render_scan_entries(entries)
+
+        count = self._with_bulk_ui_update(_render)
+        manual_n = sum(1 for e in (entries or []) if e.get("manual"))
+        if count:
+            if manual_n:
+                self.scan_status.setText(
+                    f"{count} Eintrag/Einträge ({manual_n} manuell) — ↻ zum Aktualisieren"
+                )
+            else:
+                self.scan_status.setText(
+                    f"{count} Eintrag/Einträge gespeichert — ↻ zum Aktualisieren"
+                )
+        else:
+            self.scan_status.setText("Keine Einträge — ＋ Datei oder ↻ Aktualisieren")
+        return count
+
+    def _add_manual_file(self):
+        db = getattr(self.extras_panel, "db", None)
+        if self.kind == "emu":
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Emulator (.exe) auswählen",
+                "",
+                "Programme (*.exe)",
+            )
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Python-Skript (.py) auswählen",
+                "",
+                "Python (*.py)",
+            )
+        if not path:
+            return
+        entry = _launcher_manual_add(db, self.kind, path)
+        if not entry:
+            QMessageBox.warning(
+                self,
+                self.section_title,
+                "Datei konnte nicht hinzugefügt werden.\n"
+                "Nur existierende .exe- bzw. .py-Dateien sind erlaubt.",
+            )
+            return
+        self._display_entries(self._current_entries())
+        self.extras_panel.parent_player.status_label.setText(
+            f"{self.section_title}  ·  Hinzugefügt: {Path(path).name}"
+        )
+
+    def _remove_library_entry(self, path):
+        db = getattr(self.extras_panel, "db", None)
+        if not db:
+            return
+        key = str(path).lower()
+        manual_paths = {e.get("path", "").lower() for e in _launcher_manual_load(db, self.kind)}
+        if key in manual_paths:
+            if not _launcher_manual_remove(db, self.kind, path):
+                return
+        elif not _launcher_hidden_add(db, self.kind, path):
+            return
+        self._display_entries(self._current_entries())
+        self.extras_panel.parent_player.status_label.setText(
+            f"{self.section_title}  ·  Entfernt: {Path(path).name}"
+        )
+
+    def _sync_grid_size(self, grid, inner_widget, cols):
+        count = grid.count()
+        if count <= 0:
+            inner_widget.setMinimumSize(0, 0)
+            return
+        rows = (count + cols - 1) // cols
+        tile_w, tile_h = 168, 196
+        spacing = grid.spacing()
+        used_cols = min(count, cols)
+        min_w = used_cols * tile_w + max(0, used_cols - 1) * spacing + 8
+        min_h = rows * tile_h + max(0, rows - 1) * spacing + 8
+        inner_widget.setMinimumSize(min_w, min_h)
+
+    def _with_bulk_ui_update(self, fn):
+        self.setUpdatesEnabled(False)
+        try:
+            return fn()
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def _theme(self):
+        raw = (
+            self.extras_panel.parent_player.theme
+            if hasattr(self.extras_panel.parent_player, "theme")
+            else THEMES["Midnight"]
+        )
+        db = getattr(self.extras_panel.parent_player, "db", None)
+        return raw if raw.get("hover_border") else _prepare_theme_dict(raw, db)
+
+    def _clear_layout(self, grid):
+        while grid.count():
+            item = grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _disconnect_scan_worker(self, worker):
+        if not worker:
+            return
+        for signal in (
+            getattr(worker, "progress_signal", None),
+            getattr(worker, "finished_signal", None),
+            getattr(worker, "partial_signal", None),
+        ):
+            if signal is None:
+                continue
+            try:
+                signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+
+    def _scan_paths(self):
+        db = getattr(self.extras_panel, "db", None)
+        extras = _steam_library_paths() if self.kind == "emu" else ()
+        return _launcher_scan_paths(db, self.scan_paths_key, self.default_roots, extra_paths=extras)
+
+    def _entry_labels_for_path(self, path, titles_map=None):
+        if self.kind == "emu":
+            label = _emulator_entry_label(path)
+            if label:
+                return label["name"], label.get("subtitle", "")
+            return Path(path).stem, ""
+        title = (titles_map or {}).get(path.lower(), Path(path).stem)
+        return title, Path(path).parent.name
+
+    def _add_tile(self, grid, index, path, title, subtitle, theme, host=None, *, removable=False):
+        tile = _LibraryTile(
+            path,
+            title,
+            theme,
+            self._handle_launch,
+            fallback_icon=self.fallback_icon,
+            subtitle=subtitle,
+            parent=host or self.library_inner,
+            on_remove=self._remove_library_entry if removable else None,
+        )
+        grid.addWidget(tile, index // self._LIBRARY_COLS, index % self._LIBRARY_COLS)
+
+    def refresh_history(self):
+        self._clear_layout(self.history_grid)
+        db = getattr(self.extras_panel, "db", None)
+        paths = _launcher_history_load(db, self.history_key)
+        if not paths:
+            self.history_title.setVisible(False)
+            self.history_host.setVisible(False)
+            return
+
+        self.history_title.setVisible(True)
+        self.history_host.setVisible(True)
+        theme = self._theme()
+        for i, path in enumerate(paths):
+            if self.kind == "py":
+                title = _py_tool_title_for_path(path)
+                subtitle = Path(path).parent.name
+            else:
+                title, subtitle = self._entry_labels_for_path(path)
+            self._add_tile(
+                self.history_grid, i, path, title, subtitle, theme, host=self.history_inner
+            )
+        self._sync_grid_size(self.history_grid, self.history_inner, self._LIBRARY_COLS)
+
+    def _stop_active_scan(self):
+        worker = self._scan_worker
+        if not worker:
+            return
+        worker.stop()
+        if worker.isRunning():
+            worker.wait(250)
+        self._scan_worker = None
+
+    def start_scan(self):
+        if self._scan_worker and self._scan_worker.isRunning():
+            return
+        self.scan_status.setText(f"{self.section_title} wird vorbereitet …")
+        self._scan_seq += 1
+        scan_seq = self._scan_seq
+
+        self._with_bulk_ui_update(self.refresh_history)
+        paths = self._scan_paths()
+        if not paths:
+            self.scan_status.setText("Keine Scan-Ordner konfiguriert.")
+            return
+        self.scan_status.setText(
+            f"{self.section_title} wird gesucht … ({len(paths)} Ordner)"
+        )
+        if self.kind == "emu":
+            self._scan_worker = EmulatorScanWorker(paths, self, scan_seq=scan_seq)
+        else:
+            self._scan_worker = PyToolsScanWorker(paths, self, scan_seq=scan_seq)
+        self._scan_worker.progress_signal.connect(self._on_scan_progress)
+        self._scan_worker.finished_signal.connect(
+            lambda entries, seq=scan_seq: self._on_scan_finished(entries, seq)
+        )
+        self._scan_worker.start()
+
+    def _on_scan_progress(self, msg):
+        worker = self.sender()
+        if worker is not self._scan_worker:
+            return
+        self.scan_status.setText(msg)
+
+    def _render_scan_entries(self, entries):
+        self._clear_layout(self.library_grid)
+        theme = self._theme()
+        if not entries:
+            empty = QLabel(self.empty_hint)
+            empty.setWordWrap(True)
+            empty.setMinimumWidth(320)
+            empty.setStyleSheet("color: #8892b0; font-size: 13px;")
+            self.library_grid.addWidget(empty, 0, 0, 1, self._LIBRARY_COLS)
+            self._sync_grid_size(self.library_grid, self.library_inner, self._LIBRARY_COLS)
+            self.library_host.setVisible(True)
+            return 0
+
+        for i, entry in enumerate(entries):
+            title = entry.get("name", Path(entry["path"]).stem)
+            subtitle = entry.get("subtitle", "")
+            self._add_tile(
+                self.library_grid,
+                i,
+                entry["path"],
+                title,
+                subtitle,
+                theme,
+                removable=True,
+            )
+        self._sync_grid_size(self.library_grid, self.library_inner, self._LIBRARY_COLS)
+        self.library_host.setVisible(True)
+        return len(entries)
+
+    def _on_scan_finished(self, entries, scan_seq):
+        if scan_seq != self._scan_seq:
+            return
+        db = getattr(self.extras_panel, "db", None)
+        paths = self._scan_paths()
+        _launcher_library_cache_save(db, self.kind, paths, entries)
+        self._library_loaded = True
+        merged = self._current_entries(entries)
+        count = self._display_entries(merged)
+        if not count:
+            self.scan_status.setText("Scan abgeschlossen — 0 Treffer")
+
+    def _handle_launch(self, item_path):
+        db = getattr(self.extras_panel, "db", None)
+        _launcher_history_push(db, self.history_key, item_path)
+        self.refresh_history()
+        if self.kind == "emu":
+            self._launch_exe(item_path)
+        else:
+            self.py_script_open_requested.emit(item_path)
+
+    def _launch_exe(self, exe_path):
+        try:
+            exe = Path(exe_path)
+            subprocess.Popen(
+                [str(exe)],
+                cwd=str(exe.parent),
+                **_subprocess_no_window_kwargs(),
+            )
+            self.extras_panel.parent_player.status_label.setText(
+                f"Emulator-Bibliothek  ·  Gestartet: {exe.name}"
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Emulator-Bibliothek",
+                f"Emulator konnte nicht gestartet werden:\n{exc}",
+            )
+
+    def apply_theme_styles(self):
+        t = self._theme()
+        for grid in (self.history_grid, self.library_grid):
+            for i in range(grid.count()):
+                item = grid.itemAt(i)
+                if item and item.widget() and hasattr(item.widget(), "_apply_theme"):
+                    item.widget()._apply_theme(t)
+
+
+class PyToolsLibraryPanel(QWidget):
+    """PY-Tools-Bibliothek mit eingebetteter Tool-Ansicht."""
+
+    def __init__(self, extras_panel):
+        super().__init__(extras_panel)
+        self.extras_panel = extras_panel
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.stack = QStackedWidget()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.library_view = _LauncherLibraryView(
+            self.extras_panel,
+            kind="py",
+            section_title="PY-Bibliothek",
+            empty_hint=(
+                "Keine .py-Skripte gefunden.\n"
+                "Ordner unter Einstellungen → Extras → PY-Bibliothek hinzufügen."
+            ),
+            settings_section="PY-Bibliothek",
+            fallback_icon="🐍",
+        )
+        self.library_view.py_script_open_requested.connect(self.open_script)
+        scroll.setWidget(self.library_view)
+        self.stack.addWidget(scroll)
+        layout.addWidget(self.stack)
+
+    def start_scan(self):
+        self.library_view.start_scan()
+
+    def load_library(self, *, force_rescan=False):
+        self.library_view.load_library(force_rescan=force_rescan)
+
+    def refresh_library(self):
+        self.library_view.refresh_library()
+
+    def refresh_history(self):
+        self.library_view.refresh_history()
+
+    def in_tool_view(self):
+        return self.stack.currentIndex() > 0
+
+    def show_library(self):
+        while self.stack.count() > 1:
+            w = self.stack.widget(1)
+            self.stack.removeWidget(w)
+            w.deleteLater()
+        self.stack.setCurrentIndex(0)
+
+    def open_script(self, script_path):
+        path = Path(script_path)
+        widget, err = _load_emulator_tool_widget(path, parent=self)
+        if widget is not None:
+            wrap = QScrollArea()
+            wrap.setWidgetResizable(True)
+            wrap.setFrameShape(QFrame.Shape.NoFrame)
+            wrap.setWidget(widget)
+
+            self.stack.addWidget(wrap)
+            self.stack.setCurrentWidget(wrap)
+            title = _py_tool_title_for_path(str(path))
+            self.extras_panel.title_label.setText(f"🐍  {title}")
+            self.extras_panel.parent_player.status_label.setText(
+                f"PY-Bibliothek  ·  {path.name}"
+            )
+            return
+
+        try:
+            subprocess.Popen(
+                [_python_for_script_launch(), str(path)],
+                cwd=str(path.parent),
+                **_subprocess_no_window_kwargs(),
+            )
+            self.extras_panel.parent_player.status_label.setText(
+                f"PY-Bibliothek  ·  Gestartet: {path.name}"
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "PY-Bibliothek",
+                f"Skript konnte nicht gestartet werden:\n{err or exc}",
+            )
+
+    def apply_theme_styles(self):
+        self.library_view.apply_theme_styles()
+
+
+class LauncherHubPanel(QWidget):
+    """Hub mit zwei getrennten Bibliotheken (Emulatoren + PY-Tools)."""
+
+    def __init__(self, extras_panel):
+        super().__init__(extras_panel)
+        self.extras_panel = extras_panel
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.stack = QStackedWidget()
+
+        self.hub_page = QWidget()
+        hub_layout = QVBoxLayout(self.hub_page)
+        hub_layout.setContentsMargins(0, 10, 0, 0)
+        hub_layout.setSpacing(16)
+
+        hub_desc = QLabel("Wähle eine Bibliothek — Emulatoren und PY-Tools sind getrennt verwaltet.")
+        hub_desc.setWordWrap(True)
+        hub_desc.setStyleSheet("color: #8892b0; font-size: 12px;")
+        hub_layout.addWidget(hub_desc)
+
+        self.hub_grid = QGridLayout()
+        self.hub_grid.setSpacing(16)
+        self.hub_card_emu = self.extras_panel._create_card(
+            "🎮",
+            "Emulator-Bibliothek",
+            "Emulatoren (.exe) finden, starten und Verlauf speichern.",
+            self.open_emu_library,
+        )
+        self.hub_card_py = self.extras_panel._create_card(
+            "🐍",
+            "PY-Bibliothek",
+            "Alle .py-Skripte — PyQt eingebettet oder extern mit Python gestartet.",
+            self.open_py_library,
+        )
+        self.hub_grid.addWidget(self.hub_card_emu, 0, 0)
+        self.hub_grid.addWidget(self.hub_card_py, 0, 1)
+        hub_layout.addLayout(self.hub_grid)
+        hub_layout.addStretch()
+
+        emu_scroll = QScrollArea()
+        emu_scroll.setWidgetResizable(True)
+        emu_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        emu_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        emu_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.emu_library = _LauncherLibraryView(
+            self.extras_panel,
+            kind="emu",
+            section_title="Emulator-Bibliothek",
+            empty_hint=(
+                "Keine Emulatoren gefunden.\n"
+                "Ordner unter Einstellungen → Extras → Emulator-Bibliothek hinzufügen."
+            ),
+            settings_section="Emulator-Bibliothek",
+            fallback_icon="🎮",
+        )
+        emu_scroll.setWidget(self.emu_library)
+
+        self.py_library = PyToolsLibraryPanel(self.extras_panel)
+
+        self.stack.addWidget(self.hub_page)
+        self.stack.addWidget(emu_scroll)
+        self.stack.addWidget(self.py_library)
+        layout.addWidget(self.stack)
+
+    def _both_enabled(self):
+        db = self.extras_panel.db
+        return _emu_library_enabled(db) and _py_tools_library_enabled(db)
+
+    def _update_hub_cards(self):
+        db = self.extras_panel.db
+        self.hub_card_emu.setVisible(_emu_library_enabled(db))
+        self.hub_card_py.setVisible(_py_tools_library_enabled(db))
+
+    def open_entry(self):
+        self._update_hub_cards()
+        db = self.extras_panel.db
+        emu_on = _emu_library_enabled(db)
+        py_on = _py_tools_library_enabled(db)
+        if emu_on and py_on:
+            self.stack.setCurrentWidget(self.hub_page)
+        elif emu_on:
+            self.open_emu_library()
+        elif py_on:
+            self.open_py_library()
+
+    def open_emu_library(self):
+        self.emu_library.load_library()
+        self.stack.setCurrentWidget(self.stack.widget(1))
+        self.extras_panel.title_label.setText("🎮  Emulator-Bibliothek")
+        self.emu_library.apply_theme_styles()
+
+    def open_py_library(self):
+        self.py_library.show_library()
+        self.py_library.load_library()
+        self.stack.setCurrentWidget(self.py_library)
+        self.extras_panel.title_label.setText("🐍  PY-Tools-Bibliothek")
+        self.py_library.apply_theme_styles()
+
+    def handle_back(self):
+        current = self.stack.currentWidget()
+        if current is self.py_library and self.py_library.in_tool_view():
+            self.py_library.show_library()
+            self.extras_panel.title_label.setText("🐍  PY-Tools-Bibliothek")
+            return True
+        if current is not self.hub_page and self._both_enabled():
+            self.stack.setCurrentWidget(self.hub_page)
+            self.extras_panel.title_label.setText("🚀  Launcher")
+            return True
+        return False
+
+    def reset_for_dashboard(self):
+        self.py_library.show_library()
+        self.stack.setCurrentWidget(self.hub_page)
+
+    def stop_all_scans(self):
+        self.emu_library._stop_active_scan()
+        self.py_library.library_view._stop_active_scan()
+
+    def refresh_all(self):
+        db = self.extras_panel.db
+        if _emu_library_enabled(db):
+            self.emu_library.refresh_history()
+        if _py_tools_library_enabled(db):
+            self.py_library.refresh_history()
+
+    def start_scans_for_open_view(self):
+        current = self.stack.currentWidget()
+        if current is self.stack.widget(1):
+            self.emu_library.load_library()
+        elif current is self.py_library:
+            self.py_library.load_library()
+        elif current is self.hub_page:
+            self.refresh_all()
+
+    def apply_theme_styles(self):
+        t = (
+            self.extras_panel.parent_player.theme
+            if hasattr(self.extras_panel.parent_player, "theme")
+            else THEMES["Midnight"]
+        )
+        card_ss = f"""
+            QFrame#extras_card {{
+                background-color: {t['card']};
+                border: 1px solid {t['border']};
+                border-radius: 12px;
+            }}
+            QFrame#extras_card:hover {{
+                border-color: {t['hover_border']};
+                background-color: {t['hover_bg']};
+            }}
+        """
+        for card in (self.hub_card_emu, self.hub_card_py):
+            card.setStyleSheet(card_ss)
+        self.emu_library.apply_theme_styles()
+        self.py_library.apply_theme_styles()
+
+
+EmulatorToolsPanel = LauncherHubPanel
+
+
 # ──────────────────────────── EXTRAS PANEL ────────────────────────────
 
 class ExtrasPanel(QWidget):
@@ -12395,6 +14635,7 @@ class ExtrasPanel(QWidget):
         
         grid = QGridLayout()
         grid.setSpacing(16)
+        self.dash_grid = grid
         
         self.card_autoclicker = self._create_card(
             "🖱", "Auto Clicker",
@@ -12422,13 +14663,13 @@ class ExtrasPanel(QWidget):
             f"Offline assistant — download {_GEMMA_MODEL_LABEL} ({_GEMMA_MODEL_SIZE_HINT}) and chat without internet.",
             self.open_ai_chat
         )
-        
-        grid.addWidget(self.card_autoclicker, 0, 0)
-        grid.addWidget(self.card_password, 0, 1)
-        grid.addWidget(self.card_html, 1, 0)
-        grid.addWidget(self.card_ai, 1, 1)
-        
-        self.dash_layout.addLayout(grid)
+        self.card_emulator = self._create_card(
+            "🚀", "Launcher",
+            "Emulator-Bibliothek und PY-Tools-Bibliothek — getrennt, gleiches Layout.",
+            self.open_emulator_tools
+        )
+
+        self.dash_layout.addLayout(self.dash_grid)
         self.dash_layout.addStretch()
         
         self.stack.addWidget(self.dashboard)
@@ -12448,56 +14689,125 @@ class ExtrasPanel(QWidget):
         # Offline AI Chat
         self.ai_chat_view = NovaAiChatPanel(self)
         self.stack.addWidget(self.ai_chat_view)
+
+        # PY Launcher (Emulatoren + optionale Konverter-.py)
+        self.emulator_tools_view = EmulatorToolsPanel(self)
+        self.stack.addWidget(self.emulator_tools_view)
         
         self.layout.addWidget(self.stack)
         self.apply_theme_styles()
-        self.refresh_ai_features_visibility()
+        self.refresh_extras_dashboard()
 
-    def refresh_ai_features_visibility(self):
-        """Apply Settings → Extras slider: show or hide unfinished AI tools."""
-        enabled = _extras_ai_features_enabled(self.db)
-        self.card_ai.setVisible(enabled)
-        self.html_viewer_view.set_agent_tab_visible(enabled)
+    def _clear_dash_grid(self):
+        g = self.dash_grid
+        while g.count():
+            item = g.takeAt(0)
+            if item is None:
+                break
+            w = item.widget()
+            if w is not None:
+                w.setParent(self.dashboard)
+
+    def _relayout_extras_dashboard(self, *, ai_on=None, launcher_on=None):
+        g = self.dash_grid
+        self._clear_dash_grid()
+
+        cards = (
+            self.card_autoclicker, self.card_password, self.card_html,
+            self.card_ai, self.card_emulator,
+        )
+        for card in cards:
+            card.setParent(self.dashboard)
+
+        g.setColumnStretch(0, 1)
+        g.setColumnStretch(1, 1)
+        g.setRowStretch(0, 1)
+        g.setRowStretch(1, 1)
+        g.setRowStretch(2, 1)
+
+        g.addWidget(self.card_autoclicker, 0, 0)
+        g.addWidget(self.card_password, 0, 1)
+        g.addWidget(self.card_html, 1, 0)
+
+        py_on = launcher_on if launcher_on is not None else self.card_emulator.isVisible()
+        ai_on = ai_on if ai_on is not None else self.card_ai.isVisible()
+        if py_on:
+            self.card_emulator.show()
+            g.addWidget(self.card_emulator, 1, 1)
+        else:
+            self.card_emulator.hide()
+
+        if ai_on:
+            self.card_ai.show()
+            if py_on:
+                g.addWidget(self.card_ai, 2, 0, 1, 2)
+            else:
+                g.addWidget(self.card_ai, 1, 1)
+        else:
+            self.card_ai.hide()
+
+    def refresh_extras_dashboard(self):
+        """Einstellungen: AI + Launcher-Karten und Grid."""
+        ai_enabled = _extras_ai_features_enabled(self.db)
+        launcher_enabled = _launcher_visible(self.db)
+        self.card_ai.setVisible(ai_enabled)
+        self.card_emulator.setVisible(launcher_enabled)
+        self.html_viewer_view.set_agent_tab_visible(ai_enabled)
         if getattr(self.card_html, "_desc_lbl", None):
             self.card_html._desc_lbl.setText(
-                self._html_card_desc_ai if enabled else self._html_card_desc_plain
+                self._html_card_desc_ai if ai_enabled else self._html_card_desc_plain
             )
-        if not enabled:
+        self._relayout_extras_dashboard(ai_on=ai_enabled, launcher_on=launcher_enabled)
+        if not ai_enabled:
             if self.stack.currentWidget() is self.ai_chat_view:
                 self.show_dashboard()
             elif self.stack.currentWidget() is self.html_viewer_view:
                 idx = getattr(self.html_viewer_view, "_agent_tab_index", -1)
                 if idx >= 0 and self.html_viewer_view._tabs.currentIndex() == idx:
                     self.html_viewer_view._tabs.setCurrentIndex(0)
+        if not launcher_enabled and self.stack.currentWidget() is self.emulator_tools_view:
+            self.show_dashboard()
+
+    def refresh_ai_features_visibility(self):
+        """Kompatibilität — nutzt refresh_extras_dashboard."""
+        self.refresh_extras_dashboard()
 
     def apply_theme_styles(self):
         raw = self.parent_player.theme if hasattr(self.parent_player, "theme") else THEMES["Midnight"]
         db = getattr(self.parent_player, "db", None)
         t = raw if raw.get("hover_border") else _prepare_theme_dict(raw, db)
-        pal = _ai_ui_palette(t)
+        c = _launcher_ui_colors(t)
         self.title_label.setStyleSheet(
             f"color: {t['text']}; background: transparent;"
         )
         card_ss = f"""
             QFrame#extras_card {{
-                background-color: {t['card']};
-                border: 1px solid {t['border']};
+                background-color: {c['tile_bg']};
+                border: 1px solid {c['border']};
                 border-radius: 12px;
             }}
-            QFrame#extras_card:hover {{
-                border-color: {t['hover_border']};
-                background-color: {t['hover_bg']};
+            QLabel {{
+                background: transparent;
+                color: {c['text']};
             }}
         """
         for card in (
             self.card_autoclicker, self.card_password,
-            self.card_html, self.card_ai,
+            self.card_html, self.card_ai, self.card_emulator,
         ):
             card.setStyleSheet(card_ss)
+            if getattr(card, "_desc_lbl", None):
+                card._desc_lbl.setStyleSheet(
+                    f"color: {c['subtext']}; font-size: 12px; background: transparent;"
+                )
+            if hasattr(card, "_apply_extras_card_theme"):
+                card._apply_extras_card_theme(c)
 
     def _create_card(self, icon, title, desc, callback, disabled=False):
-        card = QFrame()
+        card = QFrame(self.dashboard)
         card.setObjectName("extras_card")
+        card.setMinimumHeight(150)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         lay = QVBoxLayout(card)
         lay.setContentsMargins(20, 20, 20, 20)
@@ -12518,24 +14828,57 @@ class ExtrasPanel(QWidget):
         card._desc_lbl = desc_lbl
         
         lay.addStretch()
-        
-        t = self.parent_player.theme if hasattr(self.parent_player, "theme") else THEMES["Midnight"]
+
+        card._extras_hover = False
+        card._extras_callback = callback if not disabled else None
+
+        def _enter(ev, frm=card):
+            frm._extras_hover = True
+            self._style_extras_card(frm, hover=True)
+
+        def _leave(ev, frm=card):
+            frm._extras_hover = False
+            self._style_extras_card(frm, hover=False)
+
+        def _apply_extras_card_theme(colors):
+            card._extras_colors = colors
+            self._style_extras_card(card, hover=card._extras_hover)
+
+        card._apply_extras_card_theme = _apply_extras_card_theme
+        card.enterEvent = _enter
+        card.leaveEvent = _leave
         
         if disabled:
-            card.setStyleSheet(f"""
-                QFrame#extras_card {{
-                    background-color: {t['card']};
-                    border: 1px solid {t['border']};
-                    border-radius: 12px;
-                    opacity: 0.5;
-                }}
-            """)
-        else:
-            if callback:
-                card.mouseReleaseEvent = lambda event: callback()
-                card.setCursor(Qt.CursorShape.PointingHandCursor)
-                
+            card.setEnabled(False)
+        elif callback:
+            card.mouseReleaseEvent = lambda event, cb=callback: cb()
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self._style_extras_card(card, hover=False)
         return card
+
+    def _style_extras_card(self, card, *, hover=False):
+        raw = self.parent_player.theme if hasattr(self.parent_player, "theme") else THEMES["Midnight"]
+        db = getattr(self.parent_player, "db", None)
+        t = raw if raw.get("hover_border") else _prepare_theme_dict(raw, db)
+        c = getattr(card, "_extras_colors", None) or _launcher_ui_colors(t)
+        bg = c["tile_bg_hover"] if hover else c["tile_bg"]
+        border = c["border_hover"] if hover else c["border"]
+        card.setStyleSheet(f"""
+            QFrame#extras_card {{
+                background-color: {bg};
+                border: 1px solid {border};
+                border-radius: 12px;
+            }}
+            QLabel {{
+                background: transparent;
+                color: {c['text']};
+            }}
+        """)
+        if getattr(card, "_desc_lbl", None):
+            card._desc_lbl.setStyleSheet(
+                f"color: {c['subtext']}; font-size: 12px; background: transparent;"
+            )
 
     def show_dashboard(self):
         self.top_bar.setContentsMargins(0, 0, 0, 0)
@@ -12547,6 +14890,11 @@ class ExtrasPanel(QWidget):
         if self.stack.currentWidget() is self.html_viewer_view:
             self.html_viewer_view.exit_fullscreen_if_open()
             self.html_viewer_view.stop_agent_if_running()
+        if self.stack.currentWidget() is self.emulator_tools_view:
+            if self.emulator_tools_view.handle_back():
+                return
+            self.emulator_tools_view.reset_for_dashboard()
+            self.emulator_tools_view.stop_all_scans()
             
         self.stack.setCurrentIndex(0)
         self.parent_player.status_label.setText("Extras  ·  Utility tools")
@@ -12580,6 +14928,21 @@ class ExtrasPanel(QWidget):
         self.ai_chat_view.apply_theme_styles()
         self.ai_chat_view.refresh_status()
         self.parent_player.status_label.setText(f"Nova AI Chat  ·  Offline {_GEMMA_MODEL_LABEL}")
+
+    def open_emulator_tools(self):
+        self.back_btn.setVisible(True)
+        self.emulator_tools_view.open_entry()
+        self.stack.setCurrentWidget(self.emulator_tools_view)
+        self.emulator_tools_view.apply_theme_styles()
+        if self.emulator_tools_view._both_enabled():
+            self.title_label.setText("🚀  Launcher")
+        elif _emu_library_enabled(self.db):
+            self.title_label.setText("🎮  Emulator-Bibliothek")
+        else:
+            self.title_label.setText("🐍  PY-Tools-Bibliothek")
+        self.parent_player.status_label.setText(
+            "Launcher  ·  Emulator- & PY-Tools-Bibliothek"
+        )
 
 
 # ──────────────────────────── THUMBNAIL WORKER ────────────────────────────
@@ -13804,8 +16167,8 @@ class YouTubeBrowserPanel(QWidget):
         self.ext_dl_btn.setFixedSize(32, 32)
         self.ext_dl_btn.setObjectName("nav_btn")
         self.ext_dl_btn.setToolTip(
-            "Nova Chrome Extension installieren\n"
-            "Lädt YouTube-Videos/Audio via yt-dlp in Nova"
+            "Nova Browser Extension installieren\n"
+            "Chrome & Firefox — YouTube-Download-Button + yt-dlp in Nova"
         )
         self.ext_dl_btn.clicked.connect(self._open_extension_installer)
 
@@ -16218,8 +18581,8 @@ _LYRICS_CACHE_FILE = os.path.join(
 )
 _LYRICS_CACHE_SEP = "\u241f"
 _LYRICS_CACHE_MAX = 400
-_LYRICS_TIMEOUT_FAST = 3.5
-_LYRICS_TIMEOUT_SLOW = 5.0
+_LYRICS_TIMEOUT_FAST = 4.0
+_LYRICS_TIMEOUT_SLOW = 7.0
 
 
 def _load_lyrics_disk_cache():
@@ -16245,6 +18608,15 @@ def _load_lyrics_disk_cache():
         return cache
     except Exception:
         return {}
+
+
+def _clear_lyrics_disk_cache():
+    """Delete the on-disk lyrics fetch cache."""
+    try:
+        if os.path.exists(_LYRICS_CACHE_FILE):
+            os.remove(_LYRICS_CACHE_FILE)
+    except Exception:
+        pass
 
 
 def _save_lyrics_disk_cache(cache):
@@ -16288,50 +18660,329 @@ class LyricsFetcher(QThread):
                       '', text, flags=re.IGNORECASE)
         return text.strip()
 
+    _SECTION_NUM_RE = r"\[(verse|part|teil|strophe|couplet|refrain|bridge)\s*(\d+)\]"
+    _SECTION_OPEN_RE = r"\[(?:verse|part|teil|strophe|couplet)\s*1|(?:intro|hook|pre[- ]?chorus)\]"
+
+    @staticmethod
+    def _first_section_number(text: str) -> int:
+        """First numbered section marker (Part 1 = 1, Part 2 = 2). 0 = no marker / plain lyrics."""
+        import re
+        for line in (text or "").split("\n"):
+            s = line.strip()
+            if not s:
+                continue
+            m = re.match(LyricsFetcher._SECTION_NUM_RE, s, re.I)
+            if m:
+                return int(m.group(2))
+            if re.match(r"\[(intro|hook|pre[- ]?chorus|chorus|outro)\]", s, re.I):
+                return 1
+            return 0
+        return 0
+
+    @staticmethod
+    def _starts_at_verse_two(text: str) -> bool:
+        return LyricsFetcher._first_section_number(text) >= 2
+
+    @staticmethod
+    def _has_opening_verse(text: str) -> bool:
+        import re
+        lines = [ln for ln in (text or "").split("\n") if ln.strip()][:8]
+        head = "\n".join(lines)
+        if re.search(LyricsFetcher._SECTION_OPEN_RE, head, re.I):
+            return True
+        return LyricsFetcher._first_section_number(text) <= 1
+
+    @staticmethod
+    def _rank_lyrics_text(text: str) -> int:
+        """Higher = better. Strongly prefer lyrics that include Part 1 / Verse 1 / Intro."""
+        if not text:
+            return -1
+        lines = [ln for ln in text.split("\n") if ln.strip()]
+        score = len(lines) * 8 + min(len(text), 12000) // 10
+        sec = LyricsFetcher._first_section_number(text)
+        if sec == 0:
+            score += 400
+        elif sec == 1:
+            score += 1200
+        elif sec >= 2:
+            score -= 1500
+        if LyricsFetcher._has_opening_verse(text):
+            score += 300
+        first = lines[0].strip().lower() if lines else ""
+        if first.startswith("[chorus]") and sec >= 2:
+            score -= 400
+        return score
+
+    @staticmethod
+    def _merge_all_lyrics_candidates(candidates) -> str:
+        """Cross-merge provider results so Part 1 from one source can fill a Part 2+ snippet."""
+        unique = []
+        seen = set()
+        for candidate in candidates or []:
+            text = (candidate or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            unique.append(text)
+        if not unique:
+            return ""
+        if len(unique) == 1:
+            return unique[0]
+
+        best = max(unique, key=LyricsFetcher._rank_lyrics_text)
+        for other in unique:
+            if other == best:
+                continue
+            for primary, supplement in ((best, other), (other, best)):
+                merged = LyricsFetcher._prepend_missing_opening(primary, supplement)
+                if LyricsFetcher._rank_lyrics_text(merged) > LyricsFetcher._rank_lyrics_text(best):
+                    best = merged
+        return best
+
+    @staticmethod
+    def _extract_from_section_one(text: str) -> str:
+        """If Part/Verse 1 exists anywhere in the blob, return text starting there."""
+        import re
+        m = re.search(r"\[(?:verse|part|teil|strophe|couplet)\s*1\]", text or "", re.I)
+        if m:
+            return text[m.start():].strip()
+        return (text or "").strip()
+
+    @staticmethod
+    def _recover_best_from_pool(pool) -> str:
+        """Merge all provider variants and recover the earliest section possible."""
+        import re
+        items = []
+        seen = set()
+        for candidate in pool or []:
+            text = (candidate or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            items.append(text)
+        if not items:
+            return ""
+
+        part1_sources = []
+        for text in items:
+            extracted = LyricsFetcher._extract_from_section_one(text)
+            if re.search(r"\[(?:verse|part|teil|strophe|couplet)\s*1\]", extracted, re.I):
+                part1_sources.append(extracted)
+
+        merged = LyricsFetcher._merge_all_lyrics_candidates(items)
+        if part1_sources:
+            merged = LyricsFetcher._merge_all_lyrics_candidates(part1_sources + [merged])
+        merged = LyricsFetcher._extract_from_section_one(merged)
+        return merged
+
+    @staticmethod
+    def lrc_to_plain(synced: str) -> str:
+        """Convert synced LRC to plain text, keeping the full song from line 1."""
+        import re
+        if not synced:
+            return ""
+        lines_out = []
+        for line in synced.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                if lines_out and lines_out[-1] != "":
+                    lines_out.append("")
+                continue
+            if re.match(r"\[(ar|ti|al|au|by|offset|length|re|ve|la|key):", stripped, re.I):
+                continue
+            text = re.sub(r"\[\d{1,2}:\d{2}(?:[\.:]\d{1,3})?\]", "", stripped)
+            text = re.sub(r"<\d{1,2}:\d{2}(?:[\.:]\d{1,3})?>", "", text)
+            text = text.strip()
+            # Keep section labels like [Verse 1] even when alone on the line.
+            if not text:
+                continue
+            if text in ("♪", "♫"):
+                continue
+            lines_out.append(text)
+        while lines_out and lines_out[0] == "":
+            lines_out.pop(0)
+        while lines_out and lines_out[-1] == "":
+            lines_out.pop()
+        return "\n".join(lines_out).strip()
+
+    @staticmethod
+    def lyrics_complete_enough(text: str) -> bool:
+        """True when lyrics look like a full song, not a snippet."""
+        import re
+        finalized = LyricsFetcher._finalize_lyrics_text(text or "")
+        if not finalized:
+            return False
+        lines = [ln for ln in finalized.split("\n") if ln.strip()]
+        if len(lines) < 10 or len(finalized) < 260:
+            return False
+        if LyricsFetcher._first_section_number(finalized) >= 2:
+            return False
+        first = lines[0].strip().lower()
+        if re.match(r"\[(verse|part|teil|strophe|couplet)\s*[2-9]\]", first):
+            return False
+        head = "\n".join(lines[:8]).lower()
+        if first.startswith(("[chorus]", "[hook]")) and not re.search(
+            r"\[(verse|part|teil|strophe|couplet)\s*1|intro\]", head, re.I
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _lyrics_displayable(text: str) -> bool:
+        """Minimal check — enough content to show in the panel."""
+        finalized = LyricsFetcher._finalize_lyrics_text(text or "")
+        if not finalized:
+            return False
+        lines = [ln for ln in finalized.split("\n") if ln.strip()]
+        return len(lines) >= 2 and len(finalized) >= 20
+
+    @staticmethod
+    def _prepend_missing_opening(primary: str, supplement: str) -> str:
+        """If supplement has extra opening verses, prepend them to primary."""
+        import re
+
+        def _norm(line: str) -> str:
+            return re.sub(r"\s+", " ", (line or "").strip().lower())
+
+        if not primary:
+            return (supplement or "").strip()
+        if not supplement:
+            return primary.strip()
+
+        p_lines = [ln for ln in primary.split("\n") if ln.strip()]
+        s_lines = supplement.split("\n")
+        s_nonempty = [ln.strip() for ln in s_lines if ln.strip()]
+        if not p_lines or not s_nonempty:
+            return primary.strip()
+
+        # Supplement has Part/Verse 1 but primary does not — prefer supplement body.
+        if LyricsFetcher._has_opening_verse(supplement) and not LyricsFetcher._has_opening_verse(primary):
+            if LyricsFetcher._first_section_number(primary) >= 2:
+                return supplement.strip()
+
+        # Primary opens at Part/Verse N (N >= 2) — prepend earlier sections from supplement.
+        p_sec = LyricsFetcher._first_section_number(primary)
+        if p_sec >= 2:
+            marker_re = re.compile(
+                rf"\[(verse|part|teil|strophe|couplet)\s*{p_sec}\]",
+                re.I,
+            )
+            sec_idx = -1
+            for i, sl in enumerate(s_nonempty):
+                if marker_re.match(sl.strip()):
+                    sec_idx = i
+                    break
+            if sec_idx > 0:
+                seen = 0
+                cut_line = 0
+                for i, sl in enumerate(s_lines):
+                    if sl.strip():
+                        if seen == sec_idx:
+                            cut_line = i
+                            break
+                        seen += 1
+                prefix_lines = s_lines[:cut_line]
+                while prefix_lines and not prefix_lines[-1].strip():
+                    prefix_lines.pop()
+                prefix = "\n".join(prefix_lines).rstrip()
+                if prefix:
+                    return f"{prefix}\n{primary.lstrip()}"
+
+        first_p = _norm(p_lines[0])
+        match_idx = -1
+        for i, sl in enumerate(s_nonempty):
+            sn = _norm(sl)
+            if sn == first_p:
+                match_idx = i
+                break
+            if len(first_p) >= 10 and (sn.startswith(first_p[:10]) or first_p.startswith(sn[:10])):
+                match_idx = i
+                break
+
+        if match_idx <= 0:
+            p_blob = _norm("\n".join(p_lines))
+            s_blob = _norm("\n".join(s_nonempty))
+            if p_blob and p_blob in s_blob and len(s_blob) > len(p_blob) + 30:
+                return supplement.strip()
+            return primary.strip()
+
+        seen = 0
+        cut_line = 0
+        for i, sl in enumerate(s_lines):
+            if sl.strip():
+                if seen == match_idx:
+                    cut_line = i
+                    break
+                seen += 1
+
+        prefix_lines = s_lines[:cut_line]
+        while prefix_lines and not prefix_lines[-1].strip():
+            prefix_lines.pop()
+        prefix = "\n".join(prefix_lines).rstrip()
+        if not prefix:
+            return primary.strip()
+        return f"{prefix}\n{primary.lstrip()}"
+
+    def _pick_best_lrclib_fields(self, plain: str, synced: str) -> str:
+        """Merge plain + synced LRC — never prefer a longer plainLyrics that skips Verse 1."""
+        plain = (plain or "").strip()
+        synced_plain = self.lrc_to_plain(synced) if (synced or "").strip() else ""
+
+        if not plain and not synced_plain:
+            return ""
+        if not plain:
+            return synced_plain
+        if not synced_plain:
+            return plain
+
+        merged = self._prepend_missing_opening(plain, synced_plain)
+        candidates = [merged, synced_plain, plain]
+        if self._starts_at_verse_two(plain) and not self._starts_at_verse_two(synced_plain):
+            candidates = [merged, synced_plain]
+        return max(candidates, key=self._rank_lyrics_text)
+
     @staticmethod
     def sanitize_lyrics_text(raw: str) -> str:
-        """Remove common junk from scraped lyrics and reject partial/bad matches."""
+        """Light cleanup — strip site headers only, never eat song verses."""
         import re
 
         if not raw:
             return ""
 
-        text = str(raw).replace("\r\n", "\n").replace("\r", "\n")
-        text = text.replace("\xa0", " ")
+        text = str(raw).replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+        lines = text.split("\n")
 
-        # Common Genius-like prefixes / suffixes that are not song lyrics.
-        text = re.sub(
-            r'^\s*\d+\s+Contributors?.*?Lyrics\s*',
-            '',
-            text,
-            flags=re.IGNORECASE | re.DOTALL,
+        if lines and re.match(r"^\s*\d+\s+Contributors?", lines[0], re.IGNORECASE):
+            cut = 0
+            for i, line in enumerate(lines[:10]):
+                stripped = line.strip()
+                if i > 0 and re.match(r"^Lyrics\s*$", stripped, re.IGNORECASE):
+                    cut = i + 1
+                    break
+            if cut:
+                lines = lines[cut:]
+            else:
+                lines = lines[1:]
+
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if lines and re.match(r"^Lyrics\s*$", lines[0].strip(), re.IGNORECASE):
+            lines = lines[1:]
+
+        junk = re.compile(
+            r"^(\d+\s+Contributors?|Translations?|You might also like|Read More|\d+\s*Embed|Embed|See .+ Live)\s*$",
+            re.IGNORECASE,
         )
-        text = re.sub(r'^\s*Lyrics\s*', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'^\s*Translations?.*$', '', text, flags=re.IGNORECASE | re.MULTILINE)
-        text = re.sub(r'^\s*See .* Live\s*$', '', text, flags=re.IGNORECASE | re.MULTILINE)
-        text = re.sub(r'^\s*You might also like\s*$', '', text, flags=re.IGNORECASE | re.MULTILINE)
-        text = re.sub(r'^\s*Read More\s*$', '', text, flags=re.IGNORECASE | re.MULTILINE)
-        text = re.sub(r'\b\d*\s*Embed\s*$', '', text, flags=re.IGNORECASE)
-
-        bad_line_patterns = [
-            r'^\s*\d+\s+Contributors?.*$',
-            r'^\s*Translations?.*$',
-            r'^\s*You might also like\s*$',
-            r'^\s*Read More\s*$',
-            r'^\s*Embed\s*$',
-            r'^\s*\d+\s*Embed\s*$',
-        ]
-
         cleaned_lines = []
-        for line in text.split("\n"):
-            line = re.sub(r'\s+', ' ', line).strip()
-            if not line:
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
                 if cleaned_lines and cleaned_lines[-1] != "":
                     cleaned_lines.append("")
                 continue
-            if any(re.match(pat, line, flags=re.IGNORECASE) for pat in bad_line_patterns):
+            if i < 12 and junk.match(stripped):
                 continue
-            cleaned_lines.append(line)
+            cleaned_lines.append(stripped)
 
         while cleaned_lines and cleaned_lines[0] == "":
             cleaned_lines.pop(0)
@@ -16342,44 +18993,46 @@ class LyricsFetcher(QThread):
         while "\n\n\n" in text:
             text = text.replace("\n\n\n", "\n\n")
 
-        non_empty_lines = [ln for ln in text.split("\n") if ln.strip()]
-        lower = text.lower()
-
-        # Reject obvious bad/partial scraps so earlier providers can win.
-        if any(token in lower for token in ("contributors", "you might also like", "read more", " embed")):
-            return ""
-        if len(non_empty_lines) < 4 and len(text) < 140:
+        if len([ln for ln in cleaned_lines if ln.strip()]) < 2:
             return ""
 
         return text.strip()
 
     @staticmethod
+    def _finalize_lyrics_text(raw: str) -> str:
+        """Sanitize but fall back to raw if cleanup removed too much."""
+        raw = (raw or "").strip()
+        if not raw:
+            return ""
+        cleaned = LyricsFetcher.sanitize_lyrics_text(raw)
+        if not cleaned:
+            return raw
+        raw_lines = len([ln for ln in raw.split("\n") if ln.strip()])
+        clean_lines = len([ln for ln in cleaned.split("\n") if ln.strip()])
+        if raw_lines >= 8 and clean_lines < raw_lines - 2:
+            return raw
+        if len(cleaned) < len(raw) * 0.7 and len(raw) > 150:
+            return raw
+        return cleaned
+
+    @staticmethod
     def _score_lyrics_candidate(raw: str, source: str, exact_match: bool) -> int:
         """Heuristic: prefer fuller lyrics over partial snippets."""
-        if not raw:
+        score = LyricsFetcher._rank_lyrics_text(raw)
+        if score < 0:
             return -1
-        non_empty_lines = [ln for ln in raw.split("\n") if ln.strip()]
-        chars = len(raw)
-        score = len(non_empty_lines) * 12 + min(chars, 5000) // 18
         if exact_match:
-            score += 120
+            score += 100
         if source == "lrclib":
-            score += 80
+            score += 90
         elif source == "lrclib/search":
-            score += 55
+            score += 60
+        elif source == "lrclib/deep":
+            score += 50
         elif source == "lyrics.ovh":
-            score += 25
+            score += 30
         elif source == "genius":
-            score += 10
-        # Short snippets that start mid-song are usually weak matches.
-        if len(non_empty_lines) < 8:
-            score -= 120
-        elif len(non_empty_lines) < 14:
-            score -= 40
-        if chars < 220:
-            score -= 140
-        elif chars < 420:
-            score -= 45
+            score += 15
         return score
 
     def _try_lyrics_ovh(self, artist: str, title: str):
@@ -16391,6 +19044,58 @@ class LyricsFetcher(QThread):
             data = json.loads(resp.read().decode())
         return data.get("lyrics", "").strip()
 
+    def _lrclib_all_candidates(self, artist: str, title: str, deep: bool = False):
+        """Collect plain + synced variants from lrclib (deep=True scans more hits)."""
+        out = []
+        seen = set()
+
+        def _add(plain, synced):
+            plain = (plain or "").strip()
+            synced = (synced or "").strip()
+            synced_plain = self.lrc_to_plain(synced) if synced else ""
+            for piece in (plain, synced_plain):
+                if piece and piece not in seen:
+                    seen.add(piece)
+                    out.append(piece)
+            if plain or synced_plain:
+                merged = self._pick_best_lrclib_fields(plain, synced)
+                if merged and merged not in seen:
+                    seen.add(merged)
+                    out.append(merged)
+
+        try:
+            params = urllib.parse.urlencode({"artist_name": artist, "track_name": title})
+            url = f"https://lrclib.net/api/get?{params}"
+            req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
+            with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
+                data = json.loads(resp.read().decode())
+            _add(data.get("plainLyrics"), data.get("syncedLyrics"))
+        except Exception:
+            pass
+
+        if not deep and out:
+            return out
+
+        queries = []
+        for query in (f"{artist} {title}".strip(), title if deep else "", artist if deep else ""):
+            if query and query not in queries:
+                queries.append(query)
+        limit = 15 if deep else 8
+        for query in queries:
+            try:
+                params = urllib.parse.urlencode({"q": query})
+                url = f"https://lrclib.net/api/search?{params}"
+                req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
+                with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
+                    results = json.loads(resp.read().decode())
+                if not isinstance(results, list):
+                    continue
+                for item in results[:limit]:
+                    _add(item.get("plainLyrics"), item.get("syncedLyrics"))
+            except Exception:
+                continue
+        return out
+
     def _try_lrclib(self, artist: str, title: str):
         """lrclib.net — free, no key, returns plain lyrics or synced LRC."""
         params = urllib.parse.urlencode({"artist_name": artist, "track_name": title})
@@ -16398,20 +19103,13 @@ class LyricsFetcher(QThread):
         req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
         with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
             data = json.loads(resp.read().decode())
-        # Prefer plain lyrics; fall back to synced (strip timestamps)
         plain = (data.get("plainLyrics") or "").strip()
-        if plain:
-            return plain
         synced = (data.get("syncedLyrics") or "").strip()
-        if synced:
-            import re
-            # Strip [mm:ss.xx] timestamps
-            plain = re.sub(r'^\[\d+:\d+\.\d+\]\s*', '', synced, flags=re.MULTILINE)
-            return plain.strip()
-        return ""
+        merged = self._pick_best_lrclib_fields(plain, synced)
+        return merged or ""
 
     def _try_lrclib_search(self, artist: str, title: str):
-        """lrclib search endpoint — broader fuzzy match."""
+        """lrclib search endpoint — pick the fullest matching lyrics."""
         params = urllib.parse.urlencode({"q": f"{artist} {title}".strip()})
         url = f"https://lrclib.net/api/search?{params}"
         req = urllib.request.Request(url, headers={"User-Agent": "NovaX7/1.0"})
@@ -16419,68 +19117,138 @@ class LyricsFetcher(QThread):
             results = json.loads(resp.read().decode())
         if not isinstance(results, list):
             return ""
-        best = ""
+        best_raw = ""
+        best_score = -1
         for item in results[:5]:
             plain = (item.get("plainLyrics") or "").strip()
-            if plain:
-                cleaned = self.sanitize_lyrics_text(plain)
-                if len(cleaned) > len(best):
-                    best = cleaned
             synced = (item.get("syncedLyrics") or "").strip()
-            if synced:
-                import re
-                plain = re.sub(r'^\[\d+:\d+\.\d+\]\s*', '', synced, flags=re.MULTILINE)
-                cleaned = self.sanitize_lyrics_text(plain.strip())
-                if len(cleaned) > len(best):
-                    best = cleaned
-        return best
+            candidate = self._pick_best_lrclib_fields(plain, synced)
+            if not candidate:
+                continue
+            score = self._score_lyrics_candidate(candidate, "lrclib/search", False)
+            if score > best_score:
+                best_score = score
+                best_raw = candidate
+        return best_raw
 
-    def _try_genius(self, artist: str, title: str):
-        """Genius search scrape — no API key needed."""
+    def _scrape_genius_page(self, song_url: str) -> str:
+        """Scrape lyrics HTML from a Genius song page."""
         import re
-        query = urllib.parse.quote(f"{artist} {title}".strip())
-        url = f"https://genius.com/api/search/multi?per_page=3&q={query}"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
+        req = urllib.request.Request(song_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8",
         })
         with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
-            data = json.loads(resp.read().decode())
-        # Find the first song result
-        song_url = ""
-        for section in data.get("response", {}).get("sections", []):
-            if section.get("type") == "song":
-                hits = section.get("hits", [])
-                if hits:
-                    song_url = hits[0].get("result", {}).get("url", "")
-                    break
-        if not song_url:
-            return ""
-        # Scrape the lyrics page
-        req2 = urllib.request.Request(song_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        })
-        with urllib.request.urlopen(req2, timeout=_LYRICS_TIMEOUT_SLOW) as resp2:
-            html = resp2.read().decode("utf-8", errors="replace")
-        # Extract text from data-lyrics-container divs
-        containers = re.findall(r'data-lyrics-container="true"[^>]*>(.*?)</div>', html, re.DOTALL)
+            html = resp.read().decode("utf-8", errors="replace")
+        containers = re.findall(
+            r'data-lyrics-container="true"[^>]*>(.*?)</div>', html, re.DOTALL
+        )
+        if not containers:
+            containers = re.findall(
+                r'class="[^"]*Lyrics__Container[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL
+            )
         if not containers:
             return ""
         lines = []
         for block in containers:
-            # Replace <br> tags with newlines
-            block = re.sub(r'<br\s*/?>', "\n", block, flags=re.IGNORECASE)
-            # Remove all other HTML tags
-            block = re.sub(r'<[^>]+>', '', block)
-            # Decode HTML entities
-            block = block.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&#x27;", "'").replace("&quot;", '"')
-            lines.append(block.strip())
-        return self.sanitize_lyrics_text("\n".join(lines))
+            block = re.sub(r"<br\s*/?>", "\n", block, flags=re.IGNORECASE)
+            block = re.sub(r"<[^>]+>", "", block)
+            block = (
+                block.replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&#x27;", "'")
+                .replace("&quot;", '"')
+                .replace("&#39;", "'")
+            )
+            if block.strip():
+                lines.append(block.strip())
+        return "\n".join(lines)
+
+    def _try_genius_fast(self, artist: str, title: str):
+        """Genius — first search hit only (fast)."""
+        query = urllib.parse.quote(f"{artist} {title}".strip())
+        url = f"https://genius.com/api/search/multi?per_page=2&q={query}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
+            data = json.loads(resp.read().decode())
+        for section in data.get("response", {}).get("sections", []):
+            if section.get("type") != "song":
+                continue
+            for hit in section.get("hits", [])[:1]:
+                song_url = hit.get("result", {}).get("url", "")
+                if song_url:
+                    return self._scrape_genius_page(song_url)
+        return ""
+
+    def _try_genius(self, artist: str, title: str):
+        """Genius search scrape — fast single-page path."""
+        return self._try_genius_fast(artist, title)
+
+    def _genius_all_candidates(self, artist: str, title: str):
+        """Try several Genius search hits — some pages have fuller lyrics than others."""
+        import re
+        query = urllib.parse.quote(f"{artist} {title}".strip())
+        url = f"https://genius.com/api/search/multi?per_page=6&q={query}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT_FAST) as resp:
+            data = json.loads(resp.read().decode())
+        out = []
+        seen = set()
+        for section in data.get("response", {}).get("sections", []):
+            if section.get("type") != "song":
+                continue
+            for hit in section.get("hits", [])[:6]:
+                song_url = hit.get("result", {}).get("url", "")
+                if not song_url:
+                    continue
+                try:
+                    text = self._scrape_genius_page(song_url)
+                except Exception:
+                    continue
+                text = (text or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                out.append(text)
+        return out
+
+    def _run_provider_batch(self, providers, attempt_artist, attempt_title,
+                            _consider_result, tried, get_best) -> bool:
+        """Run providers in parallel; stop waiting once displayable lyrics exist."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(providers))
+        future_map = {
+            executor.submit(func, attempt_artist, attempt_title): source
+            for source, func in providers
+        }
+        try:
+            for future in concurrent.futures.as_completed(future_map):
+                source = future_map[future]
+                try:
+                    result = future.result()
+                    if result:
+                        _consider_result(result, source)
+                except Exception as e:
+                    tried.append(f"{source}: {e}")
+                    print(f"[Lyrics]   {source} failed: {e}")
+                if self._lyrics_displayable(get_best()):
+                    break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        return self._lyrics_displayable(get_best())
 
     def run(self):
         raw   = ""
         best_raw = ""
         best_score = -1
+        all_finalized = []
+        all_raw = []
         tried = []
 
         print(f"[Lyrics] Searching for: artist={self.artist!r}  title={self.title!r}")
@@ -16502,22 +19270,27 @@ class LyricsFetcher(QThread):
         # Build a de-duplicated list of (artist, title) attempts
         _t0 = _strip_artist_from_title(self.artist, self.title)
         _t1 = _strip_artist_from_title(artist_clean, title_clean)
-        _t2 = _t1.title()          # "lot of me" → "Lot Of Me"
-        _t3 = _t1.capitalize()     # "LOT OF ME" → "Lot of me"
 
         _seen = set()
         _attempts = []
         for _a, _t in [
             (self.artist,  _t0),
             (artist_clean, _t1),
-            (artist_clean, _t2),
-            (artist_clean, _t3),
-            ("",           _t1),   # title-only as last resort
+            ("",           _t1),
         ]:
             key = (_a.lower(), _t.lower())
             if _t and key not in _seen:
                 _seen.add(key)
                 _attempts.append((_a, _t))
+
+        fast_providers = [
+            ("lrclib", self._try_lrclib),
+            ("lyrics.ovh", self._try_lyrics_ovh),
+        ]
+        slow_providers = [
+            ("lrclib/search", self._try_lrclib_search),
+            ("genius", self._try_genius_fast),
+        ]
 
         for idx, (attempt_artist, attempt_title) in enumerate(_attempts):
             if not attempt_title:
@@ -16529,48 +19302,71 @@ class LyricsFetcher(QThread):
 
             def _consider(candidate_raw: str, source: str):
                 nonlocal best_raw, best_score
-                cleaned = self.sanitize_lyrics_text(candidate_raw)
-                if not cleaned:
-                    return False
-                score = self._score_lyrics_candidate(cleaned, source, exact_match)
-                print(f"[Lyrics] Candidate {source}: score={score} chars={len(cleaned)}")
+                if not candidate_raw:
+                    return
+                all_raw.append(candidate_raw)
+                finalized = self._finalize_lyrics_text(candidate_raw)
+                if not finalized:
+                    return
+                all_finalized.append(finalized)
+                score = self._score_lyrics_candidate(finalized, source, exact_match)
+                print(
+                    f"[Lyrics] Candidate {source}: score={score} chars={len(finalized)} "
+                    f"lines={len([ln for ln in finalized.split(chr(10)) if ln.strip()])} "
+                    f"sec={self._first_section_number(finalized)} "
+                    f"open={self._has_opening_verse(finalized)}"
+                )
                 if score > best_score:
                     best_score = score
-                    best_raw = cleaned
-                # Strong exact match: stop early.
-                return score >= 420 and exact_match
+                    best_raw = finalized
 
-            providers = [
-                ("lrclib", self._try_lrclib),
-                ("lrclib/search", self._try_lrclib_search),
-                ("lyrics.ovh", self._try_lyrics_ovh),
-            ]
-            if idx == 0:
-                providers.append(("genius", self._try_genius))
+            def _consider_result(result, source: str):
+                if isinstance(result, (list, tuple)):
+                    for item in result:
+                        _consider(item, source)
+                else:
+                    _consider(result, source)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as executor:
-                future_map = {
-                    executor.submit(func, attempt_artist, attempt_title): source
-                    for source, func in providers
-                }
-                for future in concurrent.futures.as_completed(future_map):
-                    source = future_map[future]
-                    try:
-                        raw = future.result()
-                        if raw and _consider(raw, source):
-                            break
-                    except Exception as e:
-                        tried.append(f"{source}: {e}")
-                        print(f"[Lyrics]   {source} failed: {e}")
+            get_best = lambda: best_raw
 
-            if best_score >= 420 and exact_match:
+            if self._run_provider_batch(
+                fast_providers, attempt_artist, attempt_title, _consider_result, tried, get_best
+            ):
                 break
+
+            if self._run_provider_batch(
+                slow_providers, attempt_artist, attempt_title, _consider_result, tried, get_best
+            ):
+                break
+
+        if len(all_raw) > 1:
+            merged_pool = list(all_raw)
+            merged_pool.extend(all_finalized)
+            recovered = self._recover_best_from_pool(merged_pool)
+            if recovered:
+                finalized = self._finalize_lyrics_text(recovered)
+                if finalized and (
+                    not best_raw
+                    or self._rank_lyrics_text(finalized) >= self._rank_lyrics_text(best_raw)
+                ):
+                    best_raw = finalized
 
         raw = best_raw
         if not raw:
             print(f"[Lyrics] Not found. Errors: {tried}")
             self.lyrics_failed.emit("No lyrics found.")
             return
+
+        if not self._lyrics_displayable(raw):
+            print(f"[Lyrics] Not found — result too short. Errors: {tried}")
+            self.lyrics_failed.emit("No lyrics found.")
+            return
+
+        if self._first_section_number(raw) >= 2:
+            print(
+                f"[Lyrics] Warning: starts at section {self._first_section_number(raw)} "
+                f"— showing anyway (Part 1 missing in sources)"
+            )
 
         lines = raw.split("\n")
         self.lyrics_ready.emit(raw, lines)
@@ -16650,6 +19446,8 @@ class NovaPlayer(QWidget):
 
         self.init_ui()
         self.apply_theme()
+        if hasattr(self, "extras_panel"):
+            self.extras_panel.refresh_extras_dashboard()
         self.load_library()
         self.refresh_sidebar()
         self.setAcceptDrops(True)
@@ -16678,11 +19476,11 @@ class NovaPlayer(QWidget):
         self._ext_server = NovaExtensionServer(self)
         self._ext_server.start()
 
-        # Auto-generate extension folder on every start so it's always present
+        # Regenerate extension folder on every start (wipe + fresh copy)
         try:
             self._ensure_extension_files(nova_extension_dir())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Nova] Extension folder rebuild failed: {e}")
 
     # ──────────────────────────── CHROME EXTENSION ────────────────────────────
 
@@ -16705,44 +19503,447 @@ class NovaPlayer(QWidget):
         self._ext_last_status = {"state": "error", "message": "Media browser not available"}
 
     def _ensure_extension_files(self, ext_dir):
-        """Auto-generate the Chrome extension folder and files if missing."""
+        """Remove and regenerate the Nova browser extension folder (Chrome + Firefox)."""
         import base64
+        ext_ver = "1.2.8"
         try:
+            if os.path.isdir(ext_dir):
+                try:
+                    shutil.rmtree(ext_dir)
+                except OSError as rm_err:
+                    print(f"[Nova] Extension folder locked, clearing contents: {rm_err}")
+                    for root, dirs, files in os.walk(ext_dir, topdown=False):
+                        for name in files:
+                            try:
+                                os.remove(os.path.join(root, name))
+                            except OSError:
+                                pass
+                        for name in dirs:
+                            try:
+                                os.rmdir(os.path.join(root, name))
+                            except OSError:
+                                pass
             os.makedirs(ext_dir, exist_ok=True)
-            
-            manifest_path = os.path.join(ext_dir, "manifest.json")
-            if not os.path.exists(manifest_path):
-                manifest_json = """{
+
+            def _w(name, content, binary=False):
+                path = os.path.join(ext_dir, name)
+                if binary:
+                    with open(path, "wb") as f:
+                        f.write(content)
+                else:
+                    with open(path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(content)
+
+            _w("manifest.json", f"""{{
   "manifest_version": 3,
   "name": "Nova yt-dlp Downloader",
-  "version": "1.0",
-  "description": "Download videos and audio using the Nova media browser via yt-dlp",
+  "version": "{ext_ver}",
+  "description": "Download videos and audio using Nova via yt-dlp (Chrome & Firefox)",
   "permissions": [
-    "activeTab"
+    "activeTab",
+    "scripting"
   ],
   "host_permissions": [
-    "http://127.0.0.1:8765/*"
+    "http://127.0.0.1:8765/*",
+    "*://www.youtube.com/*"
   ],
-  "action": {
+  "background": {{
+    "service_worker": "background.js"
+  }},
+  "content_scripts": [
+    {{
+      "matches": ["*://www.youtube.com/watch*"],
+      "js": ["browser-polyfill.js", "content-youtube.js"],
+      "css": ["content-youtube.css"],
+      "run_at": "document_idle"
+    }}
+  ],
+  "action": {{
     "default_popup": "popup.html",
-    "default_icon": {
+    "default_title": "Nova Downloader",
+    "default_icon": {{
       "16": "icon16.png",
       "48": "icon48.png",
       "128": "icon128.png"
-    }
-  },
-  "icons": {
+    }}
+  }},
+  "icons": {{
     "16": "icon16.png",
     "48": "icon48.png",
     "128": "icon128.png"
-  }
-}"""
-                with open(manifest_path, "w", encoding="utf-8") as f:
-                    f.write(manifest_json)
+  }},
+  "web_accessible_resources": [
+    {{
+      "resources": ["popup.html", "browser-polyfill.js", "popup.js"],
+      "matches": ["*://www.youtube.com/*"]
+    }}
+  ],
+  "browser_specific_settings": {{
+    "gecko": {{
+      "id": "nova-ytdlp@local.nova",
+      "strict_min_version": "109.0"
+    }}
+  }}
+}}""")
 
-            popup_html_path = os.path.join(ext_dir, "popup.html")
-            if not os.path.exists(popup_html_path):
-                popup_html = """<!DOCTYPE html>
+            _w("browser-polyfill.js", """/* Minimal WebExtension API shim (Chrome <-> Firefox). */
+const browser = globalThis.browser
+  || globalThis.chrome
+  || (() => { throw new Error("WebExtension API unavailable"); })();
+if (!browser.action && browser.browserAction) {
+  browser.action = browser.browserAction;
+}
+globalThis.__novaBrowser = browser;
+""")
+
+            _w("background.js", """importScripts('browser-polyfill.js');
+/* Reserved for future extension messaging — YouTube button uses in-page panel only. */
+""")
+
+            _w("content-youtube.css", """/* Keep Download on the same row as Subscribe (not stacked below). */
+ytd-watch-metadata #owner #subscribe-button,
+ytd-watch-metadata #owner .yt-flex-row:has(ytd-subscribe-button-renderer),
+ytd-watch-metadata #owner > div:has(> ytd-subscribe-button-renderer + #nova-yt-dl-wrap) {
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  flex-wrap: nowrap !important;
+  gap: 8px;
+  width: auto !important;
+}
+#nova-yt-dl-wrap {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  flex: 0 0 auto;
+  margin: 0 0 0 8px;
+  padding: 0;
+  vertical-align: middle;
+}
+#nova-yt-dl-btn {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 36px;
+  padding: 0 16px;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background: #188038;
+  color: #fff !important;
+  font-family: "Roboto", "Arial", sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: none !important;
+  outline: none !important;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background 0.15s ease;
+}
+#nova-yt-dl-btn:hover {
+  background: #1f9a44;
+}
+#nova-yt-dl-btn:active {
+  background: #157632;
+}
+#nova-ext-panel-host {
+  position: fixed;
+  top: 56px;
+  right: 16px;
+  z-index: 2147483646;
+  width: 306px;
+  height: 480px;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+  border: 1px solid rgba(255,255,255,0.08);
+  display: none;
+  background: #0d1117;
+}
+#nova-ext-panel-host iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+}
+#nova-ext-panel-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483645;
+  display: none;
+  background: transparent;
+}
+""")
+
+            _w("content-youtube.js", """/* Inject a Subscribe-style Download button on YouTube watch pages. */
+(function () {
+  const api = globalThis.__novaBrowser
+    || globalThis.browser
+    || globalThis.chrome;
+  const BTN_ID = 'nova-yt-dl-btn';
+  const WRAP_ID = 'nova-yt-dl-wrap';
+  let panelOpen = false;
+  let runtimeDead = false;
+
+  function withRuntime(fn) {
+    if (runtimeDead) return null;
+    try {
+      return fn();
+    } catch (err) {
+      const msg = String(err && err.message ? err.message : err);
+      if (msg.includes('invalidated') || msg.includes('Extension context')) {
+        runtimeDead = true;
+      }
+      return null;
+    }
+  }
+
+  function getPopupUrl() {
+    return withRuntime(() => {
+      if (!api || !api.runtime || typeof api.runtime.getURL !== 'function') {
+        return null;
+      }
+      return api.runtime.getURL('popup.html')
+        + '?url=' + encodeURIComponent(location.href);
+    });
+  }
+
+  function isWatchPage() {
+    return /\\/watch/.test(location.pathname);
+  }
+
+  function findSubscribeRoot() {
+    const owner = document.querySelector('ytd-watch-metadata #owner')
+      || document.querySelector('#above-the-fold #owner');
+    if (owner) {
+      const sub = owner.querySelector('ytd-subscribe-button-renderer');
+      if (sub) return sub;
+    }
+    return document.querySelector('ytd-watch-metadata ytd-subscribe-button-renderer')
+      || document.querySelector('ytd-subscribe-button-renderer');
+  }
+
+  function findJoinButton(parent) {
+    if (!parent) return null;
+    return parent.querySelector('ytd-sponsor-button-renderer')
+      || parent.querySelector('ytd-button-renderer.ytd-sponsor-button-renderer');
+  }
+
+  function findSubscribeButtonRow(subscribe) {
+    if (!subscribe) return null;
+    const explicit = subscribe.closest('#subscribe-button')
+      || subscribe.closest('.yt-flex-row')
+      || subscribe.closest('#owner-buttons');
+    if (explicit) return explicit;
+
+    const owner = subscribe.closest('#owner') || subscribe.closest('ytd-watch-metadata');
+    let node = subscribe.parentElement;
+    while (node && node !== owner && node !== document.body) {
+      const cs = getComputedStyle(node);
+      if (cs.display.includes('flex') && cs.flexDirection.startsWith('row')) {
+        return node;
+      }
+      if (node.id === 'subscribe-button') return node;
+      node = node.parentElement;
+    }
+    return subscribe.parentElement;
+  }
+
+  function ensureHorizontalRow(row) {
+    if (!row || !row.isConnected) return;
+    row.style.setProperty('display', 'inline-flex', 'important');
+    row.style.setProperty('flex-direction', 'row', 'important');
+    row.style.setProperty('align-items', 'center', 'important');
+    row.style.setProperty('flex-wrap', 'nowrap', 'important');
+    row.style.setProperty('gap', '8px', 'important');
+    row.style.setProperty('width', 'auto', 'important');
+  }
+
+  function placeButtonBesideSubscribe(wrap, subscribe) {
+    if (!subscribe?.isConnected) return false;
+    const row = findSubscribeButtonRow(subscribe);
+    if (!row) return false;
+
+    const owner = subscribe.closest('#owner') || subscribe.closest('ytd-watch-metadata');
+    const join = (row && findJoinButton(row))
+      || (owner && findJoinButton(owner));
+
+    if (join && row.contains(join)) {
+      if (wrap.parentElement !== row || wrap.nextElementSibling !== join) {
+        row.insertBefore(wrap, join);
+      }
+    } else if (subscribe.parentElement === row) {
+      if (wrap.parentElement !== row || wrap.previousElementSibling !== subscribe) {
+        subscribe.insertAdjacentElement('afterend', wrap);
+      }
+    } else {
+      subscribe.insertAdjacentElement('afterend', wrap);
+      if (!row.contains(wrap)) {
+        row.appendChild(wrap);
+      }
+    }
+
+    ensureHorizontalRow(row);
+    const subParent = subscribe.parentElement;
+    if (subParent && subParent !== row && subParent.contains(wrap)) {
+      ensureHorizontalRow(subParent);
+    }
+    return true;
+  }
+
+  function findSubscribeButton(subscribeRoot) {
+    if (!subscribeRoot) return null;
+    return subscribeRoot.querySelector('button.yt-spec-button-shape-next')
+      || subscribeRoot.querySelector('#subscribe-button button')
+      || subscribeRoot.querySelector('yt-button-shape button')
+      || subscribeRoot.querySelector('button');
+  }
+
+  function syncSubscribeButtonStyle(btn, subscribeRoot) {
+    if (!btn || !btn.isConnected || !subscribeRoot || !subscribeRoot.isConnected) {
+      return;
+    }
+    try {
+      const ref = findSubscribeButton(subscribeRoot);
+      if (!ref || !ref.isConnected) return;
+      const h = ref.getBoundingClientRect().height;
+      if (h > 0) {
+        btn.style.height = `${Math.round(h)}px`;
+        btn.style.minHeight = btn.style.height;
+        btn.style.maxHeight = btn.style.height;
+      }
+    } catch (e) {
+      // YouTube re-renders frequently — ignore stale nodes.
+    }
+  }
+
+  function findActionsRow() {
+    return document.querySelector('ytd-watch-metadata #actions-inner')
+      || document.querySelector('ytd-watch-metadata #actions')
+      || document.querySelector('#above-the-fold #actions');
+  }
+
+  function ensureBackdrop() {
+    let bd = document.getElementById('nova-ext-panel-backdrop');
+    if (!bd) {
+      bd = document.createElement('div');
+      bd.id = 'nova-ext-panel-backdrop';
+      bd.addEventListener('click', hidePanel);
+      document.documentElement.appendChild(bd);
+    }
+    return bd;
+  }
+
+  function ensurePanel() {
+    let host = document.getElementById('nova-ext-panel-host');
+    if (!host) {
+      const popupUrl = getPopupUrl();
+      if (!popupUrl) {
+        alert('Nova extension was updated — please refresh this YouTube page (F5).');
+        return null;
+      }
+      host = document.createElement('div');
+      host.id = 'nova-ext-panel-host';
+      const iframe = document.createElement('iframe');
+      iframe.src = popupUrl;
+      iframe.title = 'Nova Downloader';
+      host.appendChild(iframe);
+      document.documentElement.appendChild(host);
+    }
+    return host;
+  }
+
+  function showPanel() {
+    const host = ensurePanel();
+    if (!host) return;
+    const bd = ensureBackdrop();
+    host.style.display = 'block';
+    bd.style.display = 'block';
+    panelOpen = true;
+  }
+
+  function hidePanel() {
+    const host = document.getElementById('nova-ext-panel-host');
+    const bd = document.getElementById('nova-ext-panel-backdrop');
+    if (host) host.style.display = 'none';
+    if (bd) bd.style.display = 'none';
+    panelOpen = false;
+  }
+
+  function togglePanel() {
+    if (panelOpen) {
+      hidePanel();
+    } else {
+      showPanel();
+    }
+  }
+
+  function injectButton() {
+    if (!isWatchPage()) {
+      document.getElementById(WRAP_ID)?.remove();
+      return;
+    }
+    const subscribe = findSubscribeRoot();
+    if (!subscribe) {
+      return;
+    }
+    let wrap = document.getElementById(WRAP_ID);
+    let btn = document.getElementById(BTN_ID);
+    if (wrap && !wrap.isConnected) wrap = null;
+    if (btn && !btn.isConnected) btn = null;
+    if (wrap && !btn) {
+      wrap.remove();
+      wrap = null;
+    }
+    if (!wrap || !btn) {
+      if (wrap) wrap.remove();
+      wrap = document.createElement('div');
+      wrap.id = WRAP_ID;
+      btn = document.createElement('button');
+      btn.id = BTN_ID;
+      btn.type = 'button';
+      btn.textContent = 'Download';
+      btn.title = 'Nova Downloader';
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        togglePanel();
+      });
+      wrap.appendChild(btn);
+    }
+    placeButtonBesideSubscribe(wrap, subscribe);
+    if (btn) {
+      syncSubscribeButtonStyle(btn, subscribe);
+    }
+  }
+
+  let injectTimer = null;
+  function scheduleInject() {
+    if (injectTimer) return;
+    injectTimer = setTimeout(() => {
+      injectTimer = null;
+      injectButton();
+    }, 150);
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && panelOpen) {
+      hidePanel();
+    }
+  });
+
+  const observer = new MutationObserver(scheduleInject);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  scheduleInject();
+})();
+""")
+
+            popup_html = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -16989,17 +20190,15 @@ class NovaPlayer(QWidget):
     <span id="progressText" class="download-progress"></span>
   </div>
 
+  <script src="browser-polyfill.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>"""
-                with open(popup_html_path, "w", encoding="utf-8") as f:
-                    f.write(popup_html)
+            _w("popup.html", popup_html)
 
-            popup_js_path = os.path.join(ext_dir, "popup.js")
-            if not os.path.exists(popup_js_path):
-                popup_js = """const API_BASE = "http://127.0.0.1:8765";
+            _w("popup.js", """const API_BASE = "http://127.0.0.1:8765";
+const api = globalThis.__novaBrowser || globalThis.browser || globalThis.chrome;
 
-// DOM elements
 const modeVideoBtn = document.getElementById("modeVideoBtn");
 const modeAudioBtn = document.getElementById("modeAudioBtn");
 const videoOptions = document.getElementById("videoOptions");
@@ -17013,10 +20212,15 @@ const statusIndicator = document.getElementById("statusIndicator");
 const statusText = document.getElementById("statusText");
 const progressText = document.getElementById("progressText");
 
-let currentMode = "video"; // "video" or "audio"
+let currentMode = "video";
 let isNovaOnline = false;
 
-// Toggle Mode
+function fetchWithTimeout(url, options = {}, ms = 1000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...options, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
 modeVideoBtn.addEventListener("click", () => {
   if (currentMode === "video") return;
   currentMode = "video";
@@ -17038,22 +20242,18 @@ modeAudioBtn.addEventListener("click", () => {
 });
 
 function updateDownloadBtnText() {
-  if (currentMode === "video") {
-    downloadBtn.innerText = "⬇ Download Video";
-  } else {
-    downloadBtn.innerText = "⬇ Download Audio";
-  }
+  downloadBtn.innerText = currentMode === "video"
+    ? "\\u2b07 Download Video"
+    : "\\u2b07 Download Audio";
 }
 
-// Check if Nova is online
 async function checkNovaStatus() {
   try {
-    const res = await fetch(`${API_BASE}/ping`, { method: "GET", signal: AbortSignal.timeout(1000) });
+    const res = await fetchWithTimeout(`${API_BASE}/ping`, { method: "GET" }, 1000);
     if (res.ok) {
       const data = await res.json();
       if (data.ok && data.app === "NovaX7") {
         setOnline(true);
-        // Also fetch current download status if online
         await fetchAppStatus();
         return;
       }
@@ -17066,11 +20266,11 @@ async function checkNovaStatus() {
 
 async function fetchAppStatus() {
   try {
-    const res = await fetch(`${API_BASE}/status`, { method: "GET", signal: AbortSignal.timeout(1000) });
+    const res = await fetchWithTimeout(`${API_BASE}/status`, { method: "GET" }, 1000);
     if (res.ok) {
       const status = await res.json();
       if (status && status.state) {
-        let stateStr = status.state;
+        const stateStr = status.state;
         if (stateStr === "downloading") {
           progressText.innerText = "Downloading...";
           progressText.style.color = "var(--accent-purple)";
@@ -17081,12 +20281,12 @@ async function fetchAppStatus() {
           progressText.innerText = "Error";
           progressText.style.color = "var(--accent-red)";
         } else {
-          progressText.innerText = ""; // Idle or offline
+          progressText.innerText = "";
         }
       }
     }
   } catch (e) {
-    // Ignore error
+    // ignore
   }
 }
 
@@ -17104,104 +20304,120 @@ function setOnline(online) {
   }
 }
 
-// Initiate download via Nova
+function getActiveTabUrl() {
+  return new Promise((resolve) => {
+    try {
+      api.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (api.runtime.lastError) {
+          resolve(null);
+          return;
+        }
+        const tab = tabs && tabs[0];
+        resolve(tab && tab.url ? tab.url : null);
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+function pageUrlFallback() {
+  try {
+    const params = new URLSearchParams(location.search);
+    const embedded = params.get('url');
+    if (embedded && embedded.startsWith('http')) {
+      return embedded;
+    }
+  } catch (e) {
+    // ignore
+  }
+  return null;
+}
+
 downloadBtn.addEventListener("click", async () => {
   if (!isNovaOnline) return;
 
-  // Get active tab URL
-  chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-    if (!tabs || !tabs[0] || !tabs[0].url) {
-      alert("No active tab URL found.");
-      return;
-    }
+  let tabUrl = await getActiveTabUrl();
+  if (!tabUrl) {
+    tabUrl = pageUrlFallback();
+  }
+  if (!tabUrl || !tabUrl.startsWith("http")) {
+    alert("No active tab URL found. Open a video page first (e.g. YouTube).");
+    return;
+  }
 
-    const tabUrl = tabs[0].url;
-    if (!tabUrl.startsWith("http")) {
-      alert("Invalid page URL. Open a video page first (e.g. YouTube).");
-      return;
-    }
+  let format, quality;
+  if (currentMode === "video") {
+    format = videoFormat.value;
+    quality = videoQuality.value;
+  } else {
+    format = audioFormat.value;
+    quality = audioQuality.value;
+  }
 
-    // Prepare payload
-    let format, quality;
-    if (currentMode === "video") {
-      format = videoFormat.value;
-      quality = videoQuality.value;
-    } else {
-      format = audioFormat.value;
-      quality = audioQuality.value;
-    }
+  const payload = {
+    url: tabUrl,
+    mode: currentMode,
+    format: format,
+    quality: quality
+  };
 
-    const payload = {
-      url: tabUrl,
-      mode: currentMode,
-      format: format,
-      quality: quality
-    };
+  downloadBtn.disabled = true;
+  downloadBtn.innerText = "Queuing...";
 
-    // Disable button to prevent double-click
-    downloadBtn.disabled = true;
-    downloadBtn.innerText = "Queuing...";
+  try {
+    const res = await fetch(`${API_BASE}/download`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
 
-    try {
-      const res = await fetch(`${API_BASE}/download`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (res.ok) {
-        const result = await res.json();
-        if (result.ok) {
-          progressText.innerText = "Queued!";
-          progressText.style.color = "var(--accent-green)";
-          setTimeout(() => {
-            progressText.innerText = "Downloading...";
-            progressText.style.color = "var(--accent-purple)";
-          }, 1500);
-        } else {
-          alert(`Failed to queue download: ${result.error}`);
-        }
+    if (res.ok) {
+      const result = await res.json();
+      if (result.ok) {
+        progressText.innerText = "Queued!";
+        progressText.style.color = "var(--accent-green)";
+        setTimeout(() => {
+          progressText.innerText = "Downloading...";
+          progressText.style.color = "var(--accent-purple)";
+        }, 1500);
       } else {
-        alert("Failed to queue download: Server returned error status.");
+        alert(`Failed to queue download: ${result.error}`);
       }
-    } catch (err) {
-      alert(`Error connecting to Nova: ${err.message}`);
-    } finally {
-      setTimeout(() => {
-        updateDownloadBtnText();
-        if (isNovaOnline) {
-          downloadBtn.removeAttribute("disabled");
-        }
-      }, 2000);
+    } else {
+      alert("Failed to queue download: Server returned error status.");
     }
-  });
+  } catch (err) {
+    alert(`Error connecting to Nova: ${err.message}`);
+  } finally {
+    setTimeout(() => {
+      updateDownloadBtnText();
+      if (isNovaOnline) {
+        downloadBtn.removeAttribute("disabled");
+      }
+    }, 2000);
+  }
 });
 
-// Periodic status checks
 checkNovaStatus();
 const intervalId = setInterval(checkNovaStatus, 1500);
+window.addEventListener("unload", () => clearInterval(intervalId));
+""")
 
-window.addEventListener("unload", () => {
-  clearInterval(intervalId);
-});"""
-                with open(popup_js_path, "w", encoding="utf-8") as f:
-                    f.write(popup_js)
-
-            # Write icons from base64
             icons = {
                 "icon16.png": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAf0lEQVR4nGNgoBAw4pKY63f3P7pY8iZlDPWM+DQmbVSCi8/zv4fVICZCthJyHROpmtHVMzFQCJjIsR3ZFUyUuoAFXQA55HGJI8cIE7pCZElsAF2eiYFCwIQtheFyBbo4SB8TLpPRFeMyFG4AtnSOD8DUo7gAl1ewOR3Gpjg3AgAulDmrbHFBgwAAAABJRU5ErkJggg==",
                 "icon48.png": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAABL0lEQVR4nO2Z4RHCIAyFIeckuo/uYOaCHXQfXUV/eef1WiHwAgH7frfJFx4tXOLcrl1V8g6scH68Us/w/QTL61tBaxXje4GjCvG9wWsLIWcIviS+twJe6gZZhc/N69Hw19sx+Uy8PGFOkBtcZHHrSDjIOnyKZ84tFIyt/i+u+RwIRld/i28+B4YuIBjfPmucczkwosgNroP0hZzbZm2MKLitih2QXoW141OLJJpxqWUyjXjUIykyDtX2ZmqLiAXvf3NCfqOlRUSAg7BzQAqD2n6E7FXmQtXA84IPfhKn4NB/L9LoGG9B1sLzCpfaXWgJq3X4keYQ4gONgOcNHnhrUUP8t61F9DyrRJzIn+VAryI4I68YrMU3wYIFE38D2m6wMP5/TimnmRNbmNTvcp31BjrjlovRR/ZjAAAAAElFTkSuQmCC",
                 "icon128.png": "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAADfElEQVR4nO2d7W0UQRBEF8uRQD6QAxsXkwPkg1MB8cPSCSFud766qvu9/6CZqrc9s2frfBwAAAAAAAAAUIUPRwG+ff75q/ffnj8+pc4o3eZGyq4ohf1GdhSeWQjLhSuUnkUGq8UqF+8qgvwinUp3lEF2YRmKdxDh5RAkY/mq+5IyUjGg7NNAYhGVilcTIfwIqFy+wv5fKm9ehcgcQsYPxescCdsnAOVr5bNVAMrXy2mbAJSvmdcWAShfN7flAlC+dn5LBaB8/RyXCUD5HnkuEYDy17Ai1+kCUP5aZuf7eiTl6/eP0//P9uXtyMbUCcDTv4eZOU8TgPL3MivvKQJQfgwzcg//fQCIZVgAnv5YRvNnAhRnSAGefg1GeugWgPK16O2DI6A4XQLw9GvS0wsToDgIUJzbAjD+tbnbDxOgOLcE4On34E5PTIDiIEBxLgvA+Pfial9MgOIgQHEQoDiXBOD89+RKb0yA4iBAcRCgOAhQnKcCcAH05ll/TIDiIEBxEKA4CFAcBCgOAhTnNeM3ebittQV+80j4BMj4tStO+w8XQCGEyvuWEEAljIr7Db8D/CsUp3uBa/FyE0A5pMz7khRANayM+5EVQDm0TPt4Uf+zZsrhOaz/WX/SE0AlxMzrthDAJUzH9Uq9BmZ4TWwmxdtNAIeQm+i6hgWIvgg6hN3E1nO1N8sJoBZ6E1lHD9YCKITfjMtPIUBkCc28/FsCKN4DIsto4uVf7cvqNVDhNbGJF1/yCNhVUktW/m0B1I+BlWU1o/Lv9JRyAswurRmVf5fbAjhNgRnlNbPy7/aTegKMltjMyu+hhAA9ZbYC5f+he5w7f2/A/14Tm3HxPcdzmQlwpeRmXH4v3QK4XQafld3My+/tY2gCZJGgFS2/7BHwSDMvf5RhAdyngDuj+ZefANWZIgBTIIYZuU+bAEiwl1l5Tz0CkGAPM3PmDlCc6QIwBdYyO98lEwAJ1rAi12VHABJ45Ln0DoAE+jkuvwQigXZ+W94CkEA3t22vgUigmdfWzwGQQC+n7R8EIYFWPqE/ynX+vcIsD0boR8FMg/gcwn8WUF2CM3j/UuFXOhJOEfElFlFJhFOkeJkjwCGkzPuSW1DGaXAKFv+O7MLcZTiFS3/EYpFOIpwmxb9jtVhVGU6z0h+xXXikEKdx4X+TZiOrpDgTlQ0AAAAAAADl+Q0q/n7nxz37KwAAAABJRU5ErkJggg=="
             }
             for name, b64_str in icons.items():
-                icon_path = os.path.join(ext_dir, name)
-                if not os.path.exists(icon_path):
-                    with open(icon_path, "wb") as f:
-                        f.write(base64.b64decode(b64_str))
+                _w(name, base64.b64decode(b64_str), binary=True)
+            _w("extension_build.txt", ext_ver)
         except Exception as e:
             print(f"[Nova] Failed to auto-generate extension files: {e}")
+
+    def open_browser_extension_dialog(self):
+        """Show install instructions for Chrome / Firefox extension."""
+        return self.open_chrome_extension_dialog()
 
     def open_chrome_extension_dialog(self):
         """Show install instructions and open the extension folder / ZIP."""
@@ -17209,31 +20425,34 @@ window.addEventListener("unload", () => {
         self._ensure_extension_files(ext_dir)
         if not os.path.isdir(ext_dir):
             QMessageBox.warning(
-                self, "Chrome Extension",
+                self, "Browser Extension",
                 f"Extension folder not found:\n{ext_dir}",
             )
             return
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Nova Chrome Extension")
-        dlg.setMinimumWidth(480)
+        dlg.setWindowTitle("Nova Browser Extension")
+        dlg.setMinimumWidth(520)
         lay = QVBoxLayout(dlg)
         lay.setSpacing(12)
         lay.setContentsMargins(20, 20, 20, 20)
 
-        title = QLabel("Nova yt-dlp Downloader for Chrome")
+        title = QLabel("Nova yt-dlp Downloader — Chrome & Firefox")
         title.setFont(QFont("", 14, QFont.Weight.Bold))
         lay.addWidget(title)
 
         info = QLabel(
             "<b>What it does</b><br>"
-            "On any YouTube video in Chrome, open the extension popup, pick "
-            "<b>Audio</b> or <b>Video</b>, format, and quality — Nova downloads via yt-dlp.<br><br>"
-            "<b>Install (one time)</b><br>"
+            "On YouTube, a <b>Download</b> button appears next to <b>Subscribe</b> (same pill style). "
+            "Click it to open the Nova downloader menu. You can also use the toolbar icon.<br><br>"
+            "<b>Chrome</b><br>"
             "1. Keep NovaX7 running (API on port 8765)<br>"
-            "2. Chrome → <code>chrome://extensions</code><br>"
-            "3. Enable <b>Developer mode</b><br>"
-            "4. Click <b>Load unpacked</b> and select the extension folder below<br><br>"
+            "2. Open <code>chrome://extensions</code> → enable <b>Developer mode</b><br>"
+            "3. <b>Load unpacked</b> → select the folder below<br><br>"
+            "<b>Firefox</b><br>"
+            "1. Keep NovaX7 running<br>"
+            "2. Open <code>about:debugging#/runtime/this-firefox</code><br>"
+            "3. <b>Load Temporary Add-on…</b> → pick <code>manifest.json</code> in the folder below<br><br>"
             f"<small>Folder:<br><code>{ext_dir}</code></small>"
         )
         info.setWordWrap(True)
@@ -17247,12 +20466,16 @@ window.addEventListener("unload", () => {
         zip_btn = QPushButton("Save as ZIP")
         zip_btn.setObjectName("toolbar_btn")
         zip_btn.clicked.connect(lambda: self._export_extension_zip(ext_dir, dlg))
-        chrome_btn = QPushButton("Open chrome://extensions")
+        chrome_btn = QPushButton("Chrome: extensions")
         chrome_btn.setObjectName("toolbar_btn")
         chrome_btn.clicked.connect(self._open_chrome_extensions_page)
+        firefox_btn = QPushButton("Firefox: debugging")
+        firefox_btn.setObjectName("toolbar_btn")
+        firefox_btn.clicked.connect(self._open_firefox_debugging_page)
         btn_row.addWidget(open_folder)
         btn_row.addWidget(zip_btn)
         btn_row.addWidget(chrome_btn)
+        btn_row.addWidget(firefox_btn)
         lay.addLayout(btn_row)
 
         close = QPushButton("Close")
@@ -17274,7 +20497,7 @@ window.addEventListener("unload", () => {
     def _export_extension_zip(self, ext_dir, parent):
         default = os.path.join(os.path.expanduser("~"), "Downloads", "NovaYtdlpExtension.zip")
         path, _ = QFileDialog.getSaveFileName(
-            parent, "Save Chrome extension ZIP", default, "ZIP archive (*.zip)"
+            parent, "Save browser extension ZIP", default, "ZIP archive (*.zip)"
         )
         if not path:
             return
@@ -17287,6 +20510,23 @@ window.addEventListener("unload", () => {
             self._open_path(os.path.dirname(archive))
         except Exception as e:
             QMessageBox.warning(parent, "ZIP failed", str(e))
+
+    def _open_firefox_debugging_page(self):
+        url = "about:debugging#/runtime/this-firefox"
+        exe = shutil.which("firefox") or shutil.which("firefox.exe")
+        if exe:
+            try:
+                subprocess.Popen([exe, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except Exception:
+                pass
+        QMessageBox.information(
+            self,
+            "Firefox",
+            "Open Firefox and go to:\nabout:debugging#/runtime/this-firefox\n\n"
+            "Then click “Load Temporary Add-on…” and select manifest.json "
+            "in the Nova extension folder.",
+        )
 
     def _open_chrome_extensions_page(self):
         exe = None
@@ -17438,7 +20678,7 @@ window.addEventListener("unload", () => {
         self._download_menu.addAction("♫   Audio via URL", self.open_ytdlp_importer)
         self._download_menu.addAction("🎬  Video via URL", self.open_video_downloader)
         self._download_menu.addSeparator()
-        self._download_menu.addAction("⬡  Chrome Extension…", self.open_chrome_extension_dialog)
+        self._download_menu.addAction("⬡  Browser Extension…", self.open_chrome_extension_dialog)
 
         download_btn = QPushButton("⬇ Download ▾")
         download_btn.setObjectName("toolbar_btn")
@@ -17798,6 +21038,14 @@ window.addEventListener("unload", () => {
         self._lyrics_toggle_btn.clicked.connect(self._toggle_lyrics_panel)
         lyrics_header.addWidget(self._lyrics_toggle_btn)
         lyrics_header.addStretch()
+        self._lyrics_wipe_btn = QPushButton("🗑")
+        self._lyrics_wipe_btn.setObjectName("toolbar_btn")
+        self._lyrics_wipe_btn.setFixedSize(26, 26)
+        self._lyrics_wipe_btn.setToolTip(
+            "Delete ALL lyrics — database, fetch cache, and current panel"
+        )
+        self._lyrics_wipe_btn.clicked.connect(self._wipe_all_lyrics)
+        lyrics_header.addWidget(self._lyrics_wipe_btn)
         self._lyrics_save_btn = QPushButton("↓")
         self._lyrics_save_btn.setObjectName("toolbar_btn")
         self._lyrics_save_btn.setFixedSize(26, 26)
@@ -18798,6 +22046,7 @@ window.addEventListener("unload", () => {
             self.extras_panel.autoclicker_view.apply_theme_styles()
             self.extras_panel.html_viewer_view.apply_theme_styles()
             self.extras_panel.ai_chat_view.apply_theme_styles()
+            self.extras_panel.emulator_tools_view.apply_theme_styles()
 
     def _apply_liquid_glass_theme(self, t, fs, ss, ls, ff):
         """
@@ -22070,20 +25319,22 @@ window.addEventListener("unload", () => {
             row = self.db.cursor.execute("SELECT lyrics FROM videos WHERE id=?", (video_id,)).fetchone()
             db_lyrics = (row[0] or "").strip() if row else ""
 
-        if db_lyrics:
-            cleaned = LyricsFetcher.sanitize_lyrics_text(db_lyrics)
+        if db_lyrics and LyricsFetcher._lyrics_displayable(db_lyrics):
+            cleaned = LyricsFetcher._finalize_lyrics_text(db_lyrics)
             lines = cleaned.split("\n") if cleaned else []
-            # Also populate in-memory cache so subsequent switches don't re-query the DB
             if lines:
-                self._lyrics_cache[cache_key] = list(lines)
+                if LyricsFetcher.lyrics_complete_enough(cleaned):
+                    self._lyrics_cache[cache_key] = list(lines)
                 self._on_lyrics_ready(cleaned, lines)
                 return
 
         # ── 1. Check compressed on-disk cache ──────────────────────────────
         if cache_key in self._lyrics_cache:
             cached = self._lyrics_cache[cache_key]
-            self._on_lyrics_ready("\n".join(cached), cached)
-            return
+            cached_text = "\n".join(cached)
+            if LyricsFetcher._lyrics_displayable(cached_text):
+                self._on_lyrics_ready(cached_text, cached)
+                return
 
         # ── 2. API fallback ───────────────────────────────────────────────
         artist = (artist or "").strip()
@@ -22119,8 +25370,9 @@ window.addEventListener("unload", () => {
 
         # Populate in-memory cache so switching back to this song is instant
         if has_lines and self._lyrics_current_key:
-            self._lyrics_cache[self._lyrics_current_key] = list(lines)
-            _save_lyrics_disk_cache(self._lyrics_cache)
+            if LyricsFetcher.lyrics_complete_enough(_raw):
+                self._lyrics_cache[self._lyrics_current_key] = list(lines)
+                _save_lyrics_disk_cache(self._lyrics_cache)
 
         # We don't have real word-level timestamps, so distribute lines
         # evenly over the song duration. Once we know the length we update.
@@ -22128,8 +25380,8 @@ window.addEventListener("unload", () => {
         if length_ms <= 0:
             length_ms = 240_000   # fallback 4 min
         n = len(lines)
-        # Leave a short silence at start (~2 s) and don't go to the very end
-        start = 2_000
+        # Leave a short intro (~0.5 s) so the first verse is included from the start
+        start = 500
         end   = max(length_ms - 4_000, start + 1_000)
         if n > 0:
             step = (end - start) / n
@@ -22181,6 +25433,54 @@ window.addEventListener("unload", () => {
                 self.db.conn.commit()
                 self._lyrics_save_btn.setText("✓")
                 QTimer.singleShot(1500, lambda: self._lyrics_save_btn.setText("↓"))
+
+    def _wipe_all_lyrics(self):
+        """Remove every saved/fetched lyric from DB, disk cache, and the lyrics panel."""
+        if QMessageBox.question(
+            self,
+            "Wipe all lyrics?",
+            "Delete ALL lyrics from the library?\n\n"
+            "This removes fetched, pasted, and saved lyrics for every song and video, "
+            "clears the fetch cache, and cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        song_n, video_n = self.db.wipe_all_lyrics()
+        cache_n = len(self._lyrics_cache)
+        self._lyrics_cache.clear()
+        _clear_lyrics_disk_cache()
+
+        if self._lyrics_fetcher and self._lyrics_fetcher.isRunning():
+            self._lyrics_fetcher.terminate()
+            self._lyrics_fetcher.wait(2000)
+            self._lyrics_fetcher = None
+
+        self._lyrics_lines = []
+        self._lyrics_timestamps = []
+        self._lyrics_current_line = -1
+        self._lyrics_current_key = None
+        self._lyrics_song_id = None
+        self._lyrics_video_id = None
+        self._lyrics_content.setText("All lyrics removed from library and cache.")
+        self._lyrics_copy_btn.setVisible(False)
+        self._lyrics_save_btn.setVisible(False)
+        self._lyrics_fs_btn.setVisible(False)
+
+        self.status_label.setText(
+            f"Lyrics wiped — {song_n} song(s), {video_n} video(s), {cache_n} cache entries"
+        )
+        QMessageBox.information(
+            self,
+            "Lyrics wiped",
+            f"Removed lyrics from:\n"
+            f"• {song_n} song(s) in the library\n"
+            f"• {video_n} video(s) in the library\n"
+            f"• {cache_n} cached fetch(es)\n"
+            f"• on-disk lyrics cache\n\n"
+            f"Total: {song_n + video_n} database entries cleared.",
+        )
 
     def _open_lyrics_fullscreen(self):
         """Show lyrics in a full-window overlay (press Esc to close)."""
@@ -22277,7 +25577,10 @@ window.addEventListener("unload", () => {
                 self._discord.disable()
             self._start_global_media_keys()
             if hasattr(self, "extras_panel"):
-                self.extras_panel.refresh_ai_features_visibility()
+                self.extras_panel.refresh_extras_dashboard()
+                if self.extras_panel.stack.currentWidget() is self.extras_panel.emulator_tools_view:
+                    self.extras_panel.emulator_tools_view.refresh_all()
+                    self.extras_panel.emulator_tools_view.start_scans_for_open_view()
 
     def closeEvent(self, event):
         """Clean shutdown: save position, release VLC/browser/Discord resources."""
